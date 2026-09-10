@@ -1,0 +1,39 @@
+# Python 缓存与编译产物
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 虚拟环境
+.venv/
+venv/
+env/
+ENV/
+
+# 测试、类型检查与代码质量工具缓存
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+htmlcov/
+
+# Python 打包产物
+build/
+dist/
+*.egg-info/
+.eggs/
+*.egg
+*.spec
+
+# Photo Culler 本地打包与运行输出
+outputs/
+tk_runtime/
+
+# 编辑器与 IDE 配置
+.vscode/
+.idea/
+
+# 操作系统生成文件
+.DS_Store
+Thumbs.db
+desktop.ini
