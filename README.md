@@ -1,4 +1,4 @@
-注：这个仓库的内容已经停止维护，由https://github.com/cH3nj4c/photo-culler-py继承。
+注：这个仓库的内容已经停止维护，由https://github.com/cH3nj4c/photo-culler-py  继承。
 
 # Photo Culler（摄影选片）
 
