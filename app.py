@@ -56,6 +56,8 @@ THUMB_WIDTH = 132
 THUMB_HEIGHT = 88
 THUMB_SLOT = 148
 THUMB_CACHE_LIMIT = 110
+THUMB_RENDER_OVERSCAN = 3
+THUMB_RENDER_POLL_MS = 24
 JPEG_EXTENSIONS = {".jpg", ".jpeg"}
 SIDEBAR_WIDTH_DEFAULT = 238
 SIDEBAR_WIDTH_MIN = 180
@@ -112,6 +114,24 @@ class PreviewGeometry:
     target_size: tuple[int, int]
     origin: tuple[float, float]
     downsample_factor: int
+
+
+ThumbnailKey = tuple[str, int, int, int, int]
+
+
+@dataclass
+class ThumbnailCanvasItems:
+    """Canvas item IDs and the live PhotoImage reference for one visible tile."""
+
+    group_key: str
+    rect_id: int
+    image_id: int
+    marker_id: int
+    mode_id: int
+    label_id: int
+    error_id: int | None = None
+    thumb_key: ThumbnailKey | None = None
+    photo: ImageTk.PhotoImage | None = None
 
 
 def build_photo_groups(paths: list[Path]) -> list[PhotoGroup]:
@@ -176,7 +196,21 @@ class PhotoCuller(tk.Tk):
         # final settled frame still comes from the original pixels and Lanczos.
         self._preview_levels: dict[tuple[str, int], Image.Image] = {}
         self._preview_levels_lock = Lock()
-        self.thumbnail_cache: OrderedDict[int, ImageTk.PhotoImage] = OrderedDict()
+        self.thumbnail_cache: OrderedDict[ThumbnailKey, ImageTk.PhotoImage] = OrderedDict()
+        self._thumbnail_items: dict[str, ThumbnailCanvasItems] = {}
+        self._thumbnail_jobs: dict[ThumbnailKey, Future[None]] = {}
+        self._thumbnail_events: queue.Queue[
+            tuple[int, ThumbnailKey, Image.Image | None, Exception | None]
+        ] = queue.Queue()
+        self._thumbnail_generation = 0
+        self._thumbnail_render_job: str | None = None
+        self._thumbnail_center_pending = False
+        self._thumbnail_errors: set[ThumbnailKey] = set()
+        self._thumbnail_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="photo-culler-thumbnail")
+        self._thumbnail_poll_job: str | None = None
+        self._thumbnail_placeholder_photo = ImageTk.PhotoImage(
+            Image.new("RGB", (self.thumb_width, self.thumb_height), "#202329")
+        )
         # Full-resolution JPEGs live here after the background preloader reads them.
         # PhotoImage objects are deliberately not created off the Tk main thread.
         self.jpeg_cache: dict[str, Image.Image] = {}
@@ -191,6 +225,7 @@ class PhotoCuller(tk.Tk):
         self._bind_keys()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._preview_poll_job = self.after(16, self._poll_preview_render_events)
+        self._thumbnail_poll_job = self.after(THUMB_RENDER_POLL_MS, self._poll_thumbnail_events)
         self.after(250, self.open_folder)
 
     def _configure_dpi_layout(self) -> None:
@@ -340,7 +375,7 @@ class PhotoCuller(tk.Tk):
         self.thumb_scrollbar.pack(fill="x")
         self.thumb_canvas.bind("<Button-1>", self._thumbnail_clicked)
         self.thumb_canvas.bind("<MouseWheel>", self._scroll_thumbnails)
-        self.thumb_canvas.bind("<Configure>", lambda _event: self._render_thumbnails())
+        self.thumb_canvas.bind("<Configure>", lambda _event: self._schedule_thumbnail_render())
 
     def _restore_sidebar_width(self) -> None:
         """Place the sash after the first layout pass, using the saved logical width."""
@@ -462,7 +497,7 @@ class PhotoCuller(tk.Tk):
         self.folder = folder
         self.all_items = build_photo_groups(paths)
         self.index = 0
-        self.thumbnail_cache.clear()
+        self._reset_thumbnail_state()
         self._start_jpeg_preload([path for path in paths if path.suffix.lower() in JPEG_EXTENSIONS])
         saved, saved_pair_modes = self._load_selection()
         current_keys = {item.key for item in self.all_items}
@@ -1071,12 +1106,37 @@ class PhotoCuller(tk.Tk):
         if not self._preload_done:
             self.after(75, lambda: self._poll_preload_events(generation))
 
+    def _schedule_thumbnail_render(self, center: bool = False) -> None:
+        """Coalesce scrollbar, resize, and worker-completion redraw requests."""
+        self._thumbnail_center_pending = self._thumbnail_center_pending or center
+        if self._thumbnail_render_job is None:
+            self._thumbnail_render_job = self.after_idle(self._run_scheduled_thumbnail_render)
+
+    def _run_scheduled_thumbnail_render(self) -> None:
+        self._thumbnail_render_job = None
+        center = self._thumbnail_center_pending
+        self._thumbnail_center_pending = False
+        self._render_thumbnails(center=center)
+
+    def _thumbnail_cache_key(self, path: Path) -> ThumbnailKey:
+        try:
+            path_key = str(path.resolve())
+        except OSError:
+            path_key = str(path)
+        try:
+            stat = path.stat()
+        except OSError:
+            return path_key, 0, 0, self.thumb_width, self.thumb_height
+        return path_key, stat.st_mtime_ns, stat.st_size, self.thumb_width, self.thumb_height
+
     def _render_thumbnails(self, center: bool = False) -> None:
+        """Keep only a small visible/overscan set of Canvas items alive and reuse them."""
         items = self.visible_items
-        self.thumb_canvas.delete("all")
         if not items:
             self.thumb_canvas.configure(scrollregion=(0, 0, 1, self._px(120)))
+            self._clear_thumbnail_canvas_items()
             return
+
         canvas_width = max(self.thumb_canvas.winfo_width(), self.thumb_slot * 5)
         total_width = len(items) * self.thumb_slot
         self.thumb_canvas.configure(scrollregion=(0, 0, total_width, self._px(120)))
@@ -1087,57 +1147,225 @@ class PhotoCuller(tk.Tk):
 
         view_left = self.thumb_canvas.canvasx(0)
         view_right = view_left + canvas_width
-        first = max(0, int(view_left // self.thumb_slot) - 2)
-        last = min(len(items), int(view_right // self.thumb_slot) + 3)
+        first = max(0, int(view_left // self.thumb_slot) - THUMB_RENDER_OVERSCAN)
+        last = min(len(items), int(math.ceil(view_right / self.thumb_slot)) + THUMB_RENDER_OVERSCAN)
+        active_keys = {items[displayed_index].key for displayed_index in range(first, last)}
+
+        for group_key in list(self._thumbnail_items):
+            if group_key not in active_keys:
+                self._delete_thumbnail_canvas_item(self._thumbnail_items.pop(group_key))
+
         for displayed_index in range(first, last):
             item = items[displayed_index]
-            path = item.primary
-            x = displayed_index * self.thumb_slot + self.thumb_slot // 2
-            selected = displayed_index == self.index
-            color = "#4f9cff" if selected else "#343944"
-            thickness = 3 if selected else 1
-            self.thumb_canvas.create_rectangle(
-                x - self.thumb_width // 2 - self._px(3),
-                self._px(9),
-                x + self.thumb_width // 2 + self._px(3),
-                self._px(105),
-                fill="#15171b",
-                outline=color,
-                width=thickness,
-            )
-            try:
-                photo = self._thumbnail(displayed_index, path)
-                self.thumb_canvas.create_image(x, self._px(57), image=photo)
-            except Exception:
-                self.thumb_canvas.create_text(x, self._px(57), text="无法预览", fill="#aab0ba", font=("Segoe UI", 9))
-            marker = "★" if item.key in self.kept else ""
-            self.thumb_canvas.create_text(x - self._px(59), self._px(18), text=marker, fill="#ffd35a", font=("Segoe UI Symbol", 12, "bold"), anchor="nw")
-            if item.paired_raw_jpeg:
-                mode_text = self._pair_mode_label(self._pair_mode(item)) if item.key in self.kept else "未保留"
-                self.thumb_canvas.create_text(x + self._px(59), self._px(18), text=mode_text, fill="#8bd7ff", font=("Segoe UI", 7, "bold"), anchor="ne")
-            label = path.name
-            if len(label) > 18:
-                label = label[:16] + "…"
-            self.thumb_canvas.create_text(x, self._px(115), text=label, fill="#d9dde5", font=("Segoe UI", 8))
+            entry = self._thumbnail_items.get(item.key)
+            if entry is None:
+                entry = self._create_thumbnail_canvas_items(item.key)
+                self._thumbnail_items[item.key] = entry
+            self._position_thumbnail_canvas_items(entry, displayed_index)
+            self._update_thumbnail_canvas_items(entry, item, displayed_index, self._thumbnail_cache_key(item.primary))
 
-    def _thumbnail(self, displayed_index: int, path: Path) -> ImageTk.PhotoImage:
-        cache_key = hash((str(path), path.stat().st_mtime_ns, displayed_index))
-        cached = self.thumbnail_cache.get(cache_key)
-        if cached is not None:
+    def _create_thumbnail_canvas_items(self, group_key: str) -> ThumbnailCanvasItems:
+        return ThumbnailCanvasItems(
+            group_key=group_key,
+            rect_id=self.thumb_canvas.create_rectangle(
+                0,
+                0,
+                0,
+                0,
+                fill="#15171b",
+                outline="#343944",
+                width=1,
+            ),
+            image_id=self.thumb_canvas.create_image(0, 0, image=self._thumbnail_placeholder_photo),
+            marker_id=self.thumb_canvas.create_text(
+                0,
+                0,
+                text="",
+                fill="#ffd35a",
+                font=("Segoe UI Symbol", 12, "bold"),
+                anchor="nw",
+            ),
+            mode_id=self.thumb_canvas.create_text(
+                0,
+                0,
+                text="",
+                fill="#8bd7ff",
+                font=("Segoe UI", 7, "bold"),
+                anchor="ne",
+            ),
+            label_id=self.thumb_canvas.create_text(
+                0,
+                0,
+                text="",
+                fill="#d9dde5",
+                font=("Segoe UI", 8),
+            ),
+            photo=self._thumbnail_placeholder_photo,
+        )
+
+    def _position_thumbnail_canvas_items(self, entry: ThumbnailCanvasItems, displayed_index: int) -> None:
+        x = displayed_index * self.thumb_slot + self.thumb_slot // 2
+        self.thumb_canvas.coords(
+            entry.rect_id,
+            x - self.thumb_width // 2 - self._px(3),
+            self._px(9),
+            x + self.thumb_width // 2 + self._px(3),
+            self._px(105),
+        )
+        self.thumb_canvas.coords(entry.image_id, x, self._px(57))
+        self.thumb_canvas.coords(entry.marker_id, x - self._px(59), self._px(18))
+        self.thumb_canvas.coords(entry.mode_id, x + self._px(59), self._px(18))
+        self.thumb_canvas.coords(entry.label_id, x, self._px(115))
+        if entry.error_id is not None:
+            self.thumb_canvas.coords(entry.error_id, x, self._px(57))
+
+    def _update_thumbnail_canvas_items(
+        self,
+        entry: ThumbnailCanvasItems,
+        item: PhotoGroup,
+        displayed_index: int,
+        cache_key: ThumbnailKey,
+    ) -> None:
+        selected = displayed_index == self.index
+        self.thumb_canvas.itemconfigure(
+            entry.rect_id,
+            outline="#4f9cff" if selected else "#343944",
+            width=3 if selected else 1,
+        )
+        self.thumb_canvas.itemconfigure(entry.marker_id, text="★" if item.key in self.kept else "")
+        mode_text = ""
+        if item.paired_raw_jpeg:
+            mode_text = self._pair_mode_label(self._pair_mode(item)) if item.key in self.kept else "未保留"
+        self.thumb_canvas.itemconfigure(entry.mode_id, text=mode_text)
+        label = item.primary.name
+        if len(label) > 18:
+            label = label[:16] + "…"
+        self.thumb_canvas.itemconfigure(entry.label_id, text=label)
+
+        photo = self._thumbnail_cache_get(cache_key)
+        if photo is not None:
+            if entry.photo is not photo:
+                self.thumb_canvas.itemconfigure(entry.image_id, image=photo)
+                entry.photo = photo
+            self._remove_thumbnail_error(entry)
+            entry.thumb_key = cache_key
+            return
+
+        if entry.photo is not self._thumbnail_placeholder_photo:
+            self.thumb_canvas.itemconfigure(entry.image_id, image=self._thumbnail_placeholder_photo)
+            entry.photo = self._thumbnail_placeholder_photo
+        entry.thumb_key = cache_key
+        if cache_key in self._thumbnail_errors:
+            x = displayed_index * self.thumb_slot + self.thumb_slot // 2
+            if entry.error_id is None:
+                entry.error_id = self.thumb_canvas.create_text(
+                    x,
+                    self._px(57),
+                    text="无法预览",
+                    fill="#aab0ba",
+                    font=("Segoe UI", 9),
+                )
+            else:
+                self.thumb_canvas.itemconfigure(entry.error_id, text="无法预览")
+                self.thumb_canvas.coords(entry.error_id, x, self._px(57))
+        else:
+            self._remove_thumbnail_error(entry)
+            self._request_thumbnail_job(cache_key, item.primary)
+
+    def _thumbnail_cache_get(self, cache_key: ThumbnailKey) -> ImageTk.PhotoImage | None:
+        photo = self.thumbnail_cache.get(cache_key)
+        if photo is not None:
             self.thumbnail_cache.move_to_end(cache_key)
-            return cached
-        image = self._load_image(path, thumbnail=True)
-        image = self._fit_for_display(image, self.thumb_width, self.thumb_height)
-        if image.width < self.thumb_width or image.height < self.thumb_height:
-            background = Image.new("RGB", (self.thumb_width, self.thumb_height), "#202329")
-            background.paste(image, ((self.thumb_width - image.width) // 2, (self.thumb_height - image.height) // 2))
-            image = background
-        photo = ImageTk.PhotoImage(image)
+        return photo
+
+    def _thumbnail_cache_put(self, cache_key: ThumbnailKey, photo: ImageTk.PhotoImage) -> None:
         self.thumbnail_cache[cache_key] = photo
         self.thumbnail_cache.move_to_end(cache_key)
         while len(self.thumbnail_cache) > THUMB_CACHE_LIMIT:
             self.thumbnail_cache.popitem(last=False)
-        return photo
+
+    def _request_thumbnail_job(self, cache_key: ThumbnailKey, path: Path) -> None:
+        if cache_key in self.thumbnail_cache or cache_key in self._thumbnail_jobs or cache_key in self._thumbnail_errors:
+            return
+        future = self._thumbnail_executor.submit(
+            self._thumbnail_worker,
+            self._thumbnail_generation,
+            cache_key,
+            path,
+        )
+        self._thumbnail_jobs[cache_key] = future
+
+    def _thumbnail_worker(self, generation: int, cache_key: ThumbnailKey, path: Path) -> None:
+        try:
+            image = self._load_image(path, thumbnail=True)
+            image = self._fit_for_display(image, self.thumb_width, self.thumb_height)
+            if image.width < self.thumb_width or image.height < self.thumb_height:
+                background = Image.new("RGB", (self.thumb_width, self.thumb_height), "#202329")
+                background.paste(image, ((self.thumb_width - image.width) // 2, (self.thumb_height - image.height) // 2))
+                image = background
+            elif image.mode != "RGB":
+                image = image.convert("RGB")
+            self._thumbnail_events.put((generation, cache_key, image, None))
+        except Exception as exc:
+            self._thumbnail_events.put((generation, cache_key, None, exc))
+
+    def _poll_thumbnail_events(self) -> None:
+        changed = False
+        while True:
+            try:
+                generation, cache_key, image, _error = self._thumbnail_events.get_nowait()
+            except queue.Empty:
+                break
+            if generation != self._thumbnail_generation:
+                continue
+            self._thumbnail_jobs.pop(cache_key, None)
+            if image is None:
+                self._thumbnail_errors.add(cache_key)
+            else:
+                try:
+                    self._thumbnail_cache_put(cache_key, ImageTk.PhotoImage(image))
+                    self._thumbnail_errors.discard(cache_key)
+                except Exception:
+                    self._thumbnail_errors.add(cache_key)
+            changed = True
+        if changed:
+            self._schedule_thumbnail_render()
+        if self.winfo_exists():
+            self._thumbnail_poll_job = self.after(THUMB_RENDER_POLL_MS, self._poll_thumbnail_events)
+
+    def _remove_thumbnail_error(self, entry: ThumbnailCanvasItems) -> None:
+        if entry.error_id is not None:
+            self.thumb_canvas.delete(entry.error_id)
+            entry.error_id = None
+
+    def _delete_thumbnail_canvas_item(self, entry: ThumbnailCanvasItems) -> None:
+        self.thumb_canvas.delete(entry.rect_id, entry.image_id, entry.marker_id, entry.mode_id, entry.label_id)
+        self._remove_thumbnail_error(entry)
+        entry.photo = None
+
+    def _clear_thumbnail_canvas_items(self) -> None:
+        for entry in self._thumbnail_items.values():
+            self._delete_thumbnail_canvas_item(entry)
+        self._thumbnail_items.clear()
+
+    def _cancel_thumbnail_jobs(self) -> None:
+        if self._thumbnail_render_job is not None:
+            try:
+                self.after_cancel(self._thumbnail_render_job)
+            except tk.TclError:
+                pass
+            self._thumbnail_render_job = None
+        self._thumbnail_center_pending = False
+        self._thumbnail_generation += 1
+        for future in self._thumbnail_jobs.values():
+            future.cancel()
+        self._thumbnail_jobs.clear()
+
+    def _reset_thumbnail_state(self) -> None:
+        self._cancel_thumbnail_jobs()
+        self.thumbnail_cache.clear()
+        self._thumbnail_errors.clear()
+        self._clear_thumbnail_canvas_items()
 
     def _thumbnail_clicked(self, event: tk.Event) -> None:
         items = self.visible_items
@@ -1150,7 +1378,7 @@ class PhotoCuller(tk.Tk):
 
     def _scroll_thumbnails(self, event: tk.Event) -> str:
         self.thumb_canvas.xview_scroll(int(-event.delta / 120) * 3, "units")
-        self._render_thumbnails()
+        self._schedule_thumbnail_render()
         return "break"
 
     def _queue_preview_resize(self, _event: tk.Event) -> None:
@@ -1294,12 +1522,19 @@ class PhotoCuller(tk.Tk):
     def _on_close(self) -> None:
         """Stop background preview jobs before Tk tears down its image runtime."""
         self._cancel_preview_jobs()
+        self._cancel_thumbnail_jobs()
         if getattr(self, "_preview_poll_job", None) is not None:
             try:
                 self.after_cancel(self._preview_poll_job)
             except tk.TclError:
                 pass
+        if getattr(self, "_thumbnail_poll_job", None) is not None:
+            try:
+                self.after_cancel(self._thumbnail_poll_job)
+            except tk.TclError:
+                pass
         self._preview_executor.shutdown(wait=False, cancel_futures=True)
+        self._thumbnail_executor.shutdown(wait=False, cancel_futures=True)
         self.destroy()
 
 
