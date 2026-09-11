@@ -57,6 +57,9 @@ THUMB_HEIGHT = 88
 THUMB_SLOT = 148
 THUMB_CACHE_LIMIT = 110
 JPEG_EXTENSIONS = {".jpg", ".jpeg"}
+SIDEBAR_WIDTH_DEFAULT = 238
+SIDEBAR_WIDTH_MIN = 180
+SIDEBAR_WIDTH_MAX = 420
 # Keep roughly one extra screen around the visible image. During a drag this
 # buffer can move without requesting a new crop/resample operation.
 PREVIEW_OVERSCAN = 0.72
@@ -146,6 +149,7 @@ class PhotoCuller(tk.Tk):
         self.configure(bg="#17191d")
 
         self.folder: Path | None = None
+        self.sidebar_width = self._load_sidebar_width()
         self.all_items: list[PhotoGroup] = []
         self.index = 0
         self.kept: set[str] = set()
@@ -223,33 +227,75 @@ class PhotoCuller(tk.Tk):
         style.map("App.TCheckbutton", background=[("active", "#202329")], foreground=[("active", "#ffffff")])
 
     def _build_ui(self) -> None:
-        toolbar = ttk.Frame(self, style="Toolbar.TFrame", padding=(16, 10))
-        toolbar.pack(fill="x")
+        # Keep every clickable control in one right-hand column. A native
+        # PanedWindow sash lets the photographer widen or narrow that column.
+        self.layout_paned = tk.PanedWindow(
+            self,
+            orient="horizontal",
+            bg="#17191d",
+            borderwidth=0,
+            opaqueresize=True,
+            sashcursor="sb_h_double_arrow",
+            sashpad=0,
+            sashrelief="raised",
+            sashwidth=self._px(6),
+            showhandle=True,
+        )
+        self.layout_paned.pack(fill="both", expand=True, padx=16, pady=16)
+        self.layout_paned.bind("<ButtonRelease-1>", self._sidebar_resize_released)
 
-        ttk.Button(toolbar, text="打开照片文件夹  O", style="App.TButton", command=self.open_folder).pack(side="left")
-        self.folder_label = ttk.Label(toolbar, text="尚未打开文件夹", style="Header.TLabel")
-        self.folder_label.pack(side="left", padx=(14, 0))
+        control_panel = ttk.Frame(self, style="Toolbar.TFrame", padding=(12, 14))
+        self.control_panel = control_panel
 
-        ttk.Button(toolbar, text="导出保留照片  E", style="App.TButton", command=self.export_kept).pack(side="right")
-        ttk.Button(toolbar, text="适合屏幕  Z", style="App.TButton", command=self.zoom_fit).pack(side="right", padx=(0, 6))
-        ttk.Button(toolbar, text="100%  1", style="App.TButton", command=self.zoom_actual).pack(side="right", padx=(0, 6))
-        self.zoom_label = ttk.Label(toolbar, text="适合屏幕", style="Zoom.TLabel")
-        self.zoom_label.pack(side="right", padx=(0, 12))
-        ttk.Button(toolbar, text="重置模式", style="App.TButton", command=self.reset_all_pair_modes).pack(side="right", padx=(0, 6))
-        ttk.Button(toolbar, text="全不保留", style="App.TButton", command=self.clear_all_kept).pack(side="right", padx=(0, 6))
-        self.keep_mode_button = ttk.Button(toolbar, text="模式：单文件", style="App.TButton", command=self.cycle_keep_mode)
-        self.keep_mode_button.pack(side="right", padx=(0, 6))
-        ttk.Button(toolbar, text="保留 / 取消  Space", style="Keep.TButton", command=self.toggle_keep).pack(side="right", padx=(0, 10))
+        ttk.Label(control_panel, text="操作", style="Header.TLabel").pack(fill="x", pady=(0, 12))
+
+        def add_control_button(text: str, command: object, style: str = "App.TButton") -> ttk.Button:
+            button = ttk.Button(control_panel, text=text, style=style, command=command)
+            button.pack(fill="x", pady=(0, 8))
+            return button
+
+        add_control_button("打开照片文件夹  O", self.open_folder)
+        add_control_button("保留 / 取消  Space", self.toggle_keep, "Keep.TButton")
+        self.keep_mode_button = add_control_button("模式：单文件  F", self.cycle_keep_mode)
+        add_control_button("全不保留", self.clear_all_kept)
+        add_control_button("重置模式", self.reset_all_pair_modes)
+        add_control_button("导出保留照片  E", self.export_kept)
+        ttk.Separator(control_panel, orient="horizontal").pack(fill="x", pady=(2, 12))
+        add_control_button("适合屏幕  Z", self.zoom_fit)
+        add_control_button("100%  1", self.zoom_actual)
+        self.zoom_label = ttk.Label(control_panel, text="适合屏幕", style="Zoom.TLabel", anchor="center")
+        self.zoom_label.pack(fill="x", pady=(0, 12))
         ttk.Checkbutton(
-            toolbar,
+            control_panel,
             text="只看保留",
             variable=self.show_kept_only,
             style="App.TCheckbutton",
             command=self.toggle_filter,
-        ).pack(side="right", padx=(0, 16))
+        ).pack(fill="x", pady=(0, 8))
+        ttk.Label(
+            control_panel,
+            text="拖动左侧分隔线调整宽度",
+            style="Muted.TLabel",
+            anchor="center",
+        ).pack(side="bottom", fill="x", pady=(12, 0))
 
-        self.preview_frame = tk.Frame(self, bg="#111317", highlightthickness=0)
-        self.preview_frame.pack(fill="both", expand=True, padx=16, pady=(16, 8))
+        main_column = ttk.Frame(self, style="App.TFrame")
+        self.layout_paned.add(main_column, stretch="always", minsize=self._px(600))
+        self.layout_paned.add(
+            control_panel,
+            stretch="never",
+            minsize=self._px(SIDEBAR_WIDTH_MIN),
+            width=self._px(self.sidebar_width),
+        )
+        self.after_idle(self._restore_sidebar_width)
+
+        toolbar = ttk.Frame(main_column, style="Toolbar.TFrame", padding=(16, 10))
+        toolbar.pack(fill="x")
+        self.folder_label = ttk.Label(toolbar, text="尚未打开文件夹", style="Header.TLabel")
+        self.folder_label.pack(side="left")
+
+        self.preview_frame = tk.Frame(main_column, bg="#111317", highlightthickness=0)
+        self.preview_frame.pack(fill="both", expand=True, pady=(12, 8))
         self.preview_canvas = tk.Canvas(
             self.preview_frame,
             bg="#111317",
@@ -271,7 +317,7 @@ class PhotoCuller(tk.Tk):
         self.preview_canvas.bind("<B1-Motion>", self._preview_drag_motion)
         self.preview_canvas.bind("<ButtonRelease-1>", self._preview_drag_end)
 
-        info = ttk.Frame(self, style="App.TFrame", padding=(18, 5))
+        info = ttk.Frame(main_column, style="App.TFrame", padding=(0, 5))
         info.pack(fill="x")
         self.status_label = ttk.Label(info, text="", style="App.TLabel")
         self.status_label.pack(side="left")
@@ -284,8 +330,8 @@ class PhotoCuller(tk.Tk):
         )
         self.help_label.pack(side="right")
 
-        thumbs_container = tk.Frame(self, bg="#202329", height=self._px(132))
-        thumbs_container.pack(fill="x", padx=16, pady=(0, 16))
+        thumbs_container = tk.Frame(main_column, bg="#202329", height=self._px(132))
+        thumbs_container.pack(fill="x", pady=(0, 0))
         thumbs_container.pack_propagate(False)
         self.thumb_canvas = tk.Canvas(thumbs_container, bg="#202329", highlightthickness=0, height=self._px(132))
         self.thumb_scrollbar = ttk.Scrollbar(thumbs_container, orient="horizontal", command=self.thumb_canvas.xview)
@@ -295,6 +341,36 @@ class PhotoCuller(tk.Tk):
         self.thumb_canvas.bind("<Button-1>", self._thumbnail_clicked)
         self.thumb_canvas.bind("<MouseWheel>", self._scroll_thumbnails)
         self.thumb_canvas.bind("<Configure>", lambda _event: self._render_thumbnails())
+
+    def _restore_sidebar_width(self) -> None:
+        """Place the sash after the first layout pass, using the saved logical width."""
+        if not hasattr(self, "layout_paned"):
+            return
+        total_width = self.layout_paned.winfo_width()
+        if total_width <= 1:
+            return
+        min_main = self._px(600)
+        min_sidebar = self._px(SIDEBAR_WIDTH_MIN)
+        desired_sidebar = self._px(self.sidebar_width)
+        sash = total_width - desired_sidebar
+        sash = max(min_main, min(sash, total_width - min_sidebar))
+        try:
+            self.layout_paned.sashpos(0, sash)
+        except tk.TclError:
+            pass
+
+    def _sidebar_resize_released(self, _event: tk.Event) -> None:
+        """Persist the user-selected sidebar width after dragging its sash."""
+        if not hasattr(self, "control_panel"):
+            return
+        width = self.control_panel.winfo_width()
+        if width <= 1:
+            return
+        logical_width = round(width / max(self.ui_scale, 1.0))
+        logical_width = max(SIDEBAR_WIDTH_MIN, min(SIDEBAR_WIDTH_MAX, logical_width))
+        if logical_width != self.sidebar_width:
+            self.sidebar_width = logical_width
+            self._save_sidebar_width()
 
     def _bind_keys(self) -> None:
         self.bind_all("<bracketleft>", lambda _event: self.change_index(-1))
@@ -1146,6 +1222,29 @@ class PhotoCuller(tk.Tk):
             if not candidate.exists():
                 return candidate
             number += 1
+
+    def _settings_file(self) -> Path:
+        appdata = Path.home() / "AppData" / "Local" / "PhotoCuller"
+        return appdata / "settings.json"
+
+    def _load_sidebar_width(self) -> int:
+        try:
+            data = json.loads(self._settings_file().read_text(encoding="utf-8"))
+            width = int(data.get("sidebar_width", SIDEBAR_WIDTH_DEFAULT))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            width = SIDEBAR_WIDTH_DEFAULT
+        return max(SIDEBAR_WIDTH_MIN, min(SIDEBAR_WIDTH_MAX, width))
+
+    def _save_sidebar_width(self) -> None:
+        try:
+            settings_file = self._settings_file()
+            settings_file.parent.mkdir(parents=True, exist_ok=True)
+            settings_file.write_text(
+                json.dumps({"sidebar_width": self.sidebar_width}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
 
     def _selection_file(self) -> Path:
         assert self.folder is not None
