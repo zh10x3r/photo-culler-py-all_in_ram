@@ -22,6 +22,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from threading import Lock, Thread
+from time import monotonic
+from typing import Callable
 
 
 def configure_bundled_tk_runtime() -> None:
@@ -62,12 +64,19 @@ JPEG_EXTENSIONS = {".jpg", ".jpeg"}
 SIDEBAR_WIDTH_DEFAULT = 238
 SIDEBAR_WIDTH_MIN = 180
 SIDEBAR_WIDTH_MAX = 420
-# Keep roughly one extra screen around the visible image. During a drag this
-# buffer can move without requesting a new crop/resample operation.
-PREVIEW_OVERSCAN = 0.72
-PREVIEW_OVERSCAN_MAX_PX = 560
-PREVIEW_INTERACTIVE_DELAY_MS = 24
-PREVIEW_QUALITY_DELAY_MS = 150
+SCAN_PROGRESS_MIN_INTERVAL = 0.08
+PREVIEW_RENDER_DELAY_MS = 90
+PREVIEW_RESAMPLING_FILTER = Image.Resampling.BICUBIC
+PREVIEW_REDUCING_GAP = 2.0
+PREVIEW_OVERSCAN_FRACTION = 0.18
+PREVIEW_OVERSCAN_MAX_PX = 320
+PREVIEW_DRAG_RENDER_DELAY_MS = 45
+ZOOM_MAX_SCALE = 4.0
+ZOOM_FACTOR_PER_STEP = 2 ** (1 / 6)
+ZOOM_ANIMATION_INTERVAL_MS = 16
+ZOOM_RENDER_INTERVAL_MS = 32
+ZOOM_RESPONSE = 14.0
+ZOOM_SETTLE_RELATIVE_EPSILON = 0.0015
 
 
 def enable_windows_high_dpi() -> None:
@@ -91,6 +100,24 @@ def enable_windows_high_dpi() -> None:
         pass
 
 
+def clamp_zoom_scale(scale: float, fit_scale: float) -> float:
+    """Keep an interactive view between fit-to-window and 400%."""
+    return max(fit_scale, min(ZOOM_MAX_SCALE, scale))
+
+
+def zoom_target_after_wheel(target_scale: float, steps: float, fit_scale: float) -> float:
+    """Accumulate wheel input without allowing one device event to jump wildly."""
+    bounded_steps = max(-8.0, min(8.0, steps))
+    return clamp_zoom_scale(target_scale * (ZOOM_FACTOR_PER_STEP**bounded_steps), fit_scale)
+
+
+def advance_zoom_scale(current: float, target: float, elapsed: float) -> float:
+    """Move toward the target with a frame-rate-independent exponential response."""
+    elapsed = max(0.0, min(elapsed, 0.05))
+    blend = 1.0 - math.exp(-ZOOM_RESPONSE * elapsed)
+    return current + (target - current) * blend
+
+
 @dataclass(frozen=True)
 class PhotoGroup:
     """One culling decision, optionally made of a DNG and its JPEG preview."""
@@ -107,13 +134,106 @@ class PhotoGroup:
 
 
 @dataclass(frozen=True)
+class ScanResult:
+    """Files discovered below a folder and any entries that could not be read."""
+
+    paths: tuple[Path, ...]
+    directories_scanned: int
+    skipped_links: int
+    errors: tuple[str, ...]
+    cancelled: bool = False
+
+
+def _entry_is_link_or_junction(entry: os.DirEntry[str]) -> bool:
+    """Return whether a directory entry must not be followed during a scan."""
+    try:
+        if entry.is_symlink():
+            return True
+        is_junction = getattr(entry, "is_junction", None)
+        if callable(is_junction) and is_junction():
+            return True
+    except OSError:
+        # A disappearing or inaccessible reparse point is safer to skip than
+        # to follow blindly while the directory tree is changing.
+        return True
+    return False
+
+
+def scan_photo_tree(
+    root: Path,
+    *,
+    progress: Callable[[int, int, int, int], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
+) -> ScanResult:
+    """Iteratively discover supported images below *root*.
+
+    Directory entries are inspected with ``os.scandir`` so metadata lookups
+    can use the information returned by the operating system. Symbolic links
+    and Windows junctions are deliberately not followed; this keeps a scan
+    inside the chosen tree and prevents cycles. Errors are collected per
+    directory/entry so one inaccessible branch does not discard the rest.
+    """
+    root = Path(root)
+    pending = [root]
+    paths: list[Path] = []
+    errors: list[str] = []
+    directories_scanned = 0
+    skipped_links = 0
+    last_report_at = 0.0
+    last_report_state: tuple[int, int, int] | None = None
+
+    def report(force: bool = False) -> None:
+        nonlocal last_report_at, last_report_state
+        if progress is None:
+            return
+        now = monotonic()
+        state = (len(paths), directories_scanned, skipped_links + len(errors))
+        if not force and now - last_report_at < SCAN_PROGRESS_MIN_INTERVAL and state == last_report_state:
+            return
+        last_report_at = now
+        last_report_state = state
+        progress(state[0], state[1], skipped_links, len(errors))
+
+    while pending:
+        if should_cancel is not None and should_cancel():
+            report(force=True)
+            return ScanResult(tuple(paths), directories_scanned, skipped_links, tuple(errors), cancelled=True)
+
+        directory = pending.pop()
+        directories_scanned += 1
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    if should_cancel is not None and should_cancel():
+                        report(force=True)
+                        return ScanResult(tuple(paths), directories_scanned, skipped_links, tuple(errors), cancelled=True)
+                    try:
+                        if _entry_is_link_or_junction(entry):
+                            skipped_links += 1
+                            continue
+                        if entry.is_dir(follow_symlinks=False):
+                            pending.append(Path(entry.path))
+                            continue
+                        if entry.is_file(follow_symlinks=False) and Path(entry.name).suffix.casefold() in SUPPORTED_EXTENSIONS:
+                            paths.append(Path(entry.path))
+                    except OSError as exc:
+                        errors.append(f"{entry.path}: {exc}")
+                    report()
+        except OSError as exc:
+            errors.append(f"{directory}: {exc}")
+        report()
+
+    report(force=True)
+    return ScanResult(tuple(paths), directories_scanned, skipped_links, tuple(errors))
+
+
+@dataclass(frozen=True)
 class PreviewGeometry:
-    """The source region and on-canvas position for one preview frame."""
+    """A source crop and its screen placement for one Bicubic preview frame."""
 
     source_box: tuple[int, int, int, int]
     target_size: tuple[int, int]
     origin: tuple[float, float]
-    downsample_factor: int
 
 
 ThumbnailKey = tuple[str, int, int, int, int]
@@ -134,11 +254,40 @@ class ThumbnailCanvasItems:
     photo: ImageTk.PhotoImage | None = None
 
 
-def build_photo_groups(paths: list[Path]) -> list[PhotoGroup]:
-    """Hide DNG + JPEG pairs behind one culling item, without grouping unrelated files."""
-    by_stem: dict[str, list[Path]] = {}
+def _resolved_path_string(path: Path) -> str:
+    """Return the historical absolute path spelling used by selection records."""
+    try:
+        return str(path.resolve())
+    except OSError:
+        return os.path.abspath(str(path))
+
+
+def _path_identity(path: Path) -> str:
+    """Return a case-insensitive absolute path identity for grouping."""
+    return os.path.normcase(_resolved_path_string(path))
+
+
+def _relative_path_sort_key(path: Path, root: Path | None = None) -> tuple[int, tuple[str, ...]]:
+    try:
+        relative = path.relative_to(root) if root is not None else path
+    except ValueError:
+        relative = path
+    parts = tuple(part.casefold() for part in relative.parts)
+    # Keep files directly inside the selected folder before deeper folders,
+    # then make every remaining position deterministic by relative path.
+    return len(parts), parts
+
+
+def _group_sort_key(item: PhotoGroup, root: Path | None = None) -> tuple[int, tuple[str, ...]]:
+    return _relative_path_sort_key(item.primary, root)
+
+
+def build_photo_groups(paths: list[Path], root: Path | None = None) -> list[PhotoGroup]:
+    """Hide DNG + JPEG pairs behind one culling item, without cross-folder pairing."""
+    by_stem: dict[tuple[str, str], list[Path]] = {}
     for path in paths:
-        by_stem.setdefault(path.stem.casefold(), []).append(path)
+        parent_key = _path_identity(path.parent)
+        by_stem.setdefault((parent_key, path.stem.casefold()), []).append(path)
 
     result: list[PhotoGroup] = []
     for same_name_paths in by_stem.values():
@@ -149,16 +298,16 @@ def build_photo_groups(paths: list[Path]) -> list[PhotoGroup]:
         if raws and jpegs:
             # JPEG is much faster to browse and represents the same capture.
             primary = jpegs[0]
-            key = "pair|" + str(primary.parent.resolve()).casefold() + "|" + primary.stem.casefold()
+            key = "pair|" + _resolved_path_string(primary.parent).casefold() + "|" + primary.stem.casefold()
             result.append(PhotoGroup(key=key, primary=primary, members=paired_members))
             paired_paths = set(paired_members)
             for path in ordered:
                 if path not in paired_paths:
-                    result.append(PhotoGroup(key=str(path.resolve()), primary=path, members=(path,)))
+                    result.append(PhotoGroup(key=_resolved_path_string(path), primary=path, members=(path,)))
         else:
             for path in ordered:
-                result.append(PhotoGroup(key=str(path.resolve()), primary=path, members=(path,)))
-    return sorted(result, key=lambda item: item.primary.name.casefold())
+                result.append(PhotoGroup(key=_resolved_path_string(path), primary=path, members=(path,)))
+    return sorted(result, key=lambda item: _group_sort_key(item, root))
 
 
 class PhotoCuller(tk.Tk):
@@ -169,6 +318,13 @@ class PhotoCuller(tk.Tk):
         self.configure(bg="#17191d")
 
         self.folder: Path | None = None
+        self._scan_folder: Path | None = None
+        self._scan_notice = ""
+        self._scan_generation = 0
+        self._scan_future: Future[None] | None = None
+        self._scan_events: queue.Queue[tuple[int, str, object]] = queue.Queue()
+        self._scan_poll_job: str | None = None
+        self._scan_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="photo-culler-scan")
         self.sidebar_width = self._load_sidebar_width()
         self.all_items: list[PhotoGroup] = []
         self.index = 0
@@ -181,21 +337,21 @@ class PhotoCuller(tk.Tk):
         self._preview_item_size: tuple[int, int] | None = None
         self.current_source_image: Image.Image | None = None
         self.current_source_path: Path | None = None
-        self.zoom_scale = 1.0  # Screen pixels for each source pixel; 1.0 means 100%.
         self.fit_scale = 1.0
+        self.zoom_scale = 1.0
+        self.zoom_target_scale = 1.0
         self.pan_x = 0.0
         self.pan_y = 0.0
+        self._zoom_anchor: tuple[float, float, float, float] | None = None
+        self._zoom_animation_job: str | None = None
+        self._zoom_animation_last_time: float | None = None
+        self._zoom_last_render_at = 0.0
         self._drag_state: tuple[int, int, float, float] | None = None
-        self._interactive_render_job: str | None = None
-        self._quality_render_job: str | None = None
+        self._preview_render_job: str | None = None
         self._preview_render_generation = 0
         self._preview_render_events: queue.Queue[tuple[int, str, Image.Image | None, PreviewGeometry | None, Exception | None]] = queue.Queue()
-        self._preview_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="photo-culler-preview")
+        self._preview_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="photo-culler-preview")
         self._preview_futures: set[Future[None]] = set()
-        # Interactive frames use a small, per-current-photo image pyramid. The
-        # final settled frame still comes from the original pixels and Lanczos.
-        self._preview_levels: dict[tuple[str, int], Image.Image] = {}
-        self._preview_levels_lock = Lock()
         self.thumbnail_cache: OrderedDict[ThumbnailKey, ImageTk.PhotoImage] = OrderedDict()
         self._thumbnail_items: dict[str, ThumbnailCanvasItems] = {}
         self._thumbnail_jobs: dict[ThumbnailKey, Future[None]] = {}
@@ -226,6 +382,7 @@ class PhotoCuller(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._preview_poll_job = self.after(16, self._poll_preview_render_events)
         self._thumbnail_poll_job = self.after(THUMB_RENDER_POLL_MS, self._poll_thumbnail_events)
+        self._scan_poll_job = self.after(60, self._poll_scan_events)
         self.after(250, self.open_folder)
 
     def _configure_dpi_layout(self) -> None:
@@ -360,7 +517,7 @@ class PhotoCuller(tk.Tk):
         self.preload_label.pack(side="left", padx=(18, 0))
         self.help_label = ttk.Label(
             info,
-            text="[ ] 切换 · Space 保留 · F 模式 · 滚轮缩放 · Z 适合/100% · + − 微调",
+            text="[ ] 切换 · Space 保留 · F 模式 · 滚轮缩放 · 拖动平移 · Z 适合/100%",
             style="Muted.TLabel",
         )
         self.help_label.pack(side="right")
@@ -484,21 +641,108 @@ class PhotoCuller(tk.Tk):
         chosen = filedialog.askdirectory(title="选择包含照片的文件夹", initialdir=str(self.folder) if self.folder else None)
         if not chosen:
             return
-        folder = Path(chosen)
-        try:
-            paths = sorted(
-                (path for path in folder.iterdir() if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS),
-                key=lambda path: path.name.casefold(),
-            )
-        except OSError as exc:
-            messagebox.showerror(APP_NAME, f"无法读取这个文件夹：\n{exc}")
-            return
+        self._begin_folder_scan(Path(chosen))
 
-        self.folder = folder
-        self.all_items = build_photo_groups(paths)
+    def _begin_folder_scan(self, folder: Path) -> None:
+        """Clear the current gallery and scan the selected tree in the background."""
+        self._scan_generation += 1
+        generation = self._scan_generation
+        if self._scan_future is not None:
+            self._scan_future.cancel()
+            self._scan_future = None
+        while True:
+            try:
+                self._scan_events.get_nowait()
+            except queue.Empty:
+                break
+
+        # Do not let an unfinished scan expose the previous folder's choices.
+        self.folder = None
+        self._scan_folder = folder
+        self._scan_notice = ""
+        self.all_items = []
         self.index = 0
+        self.kept = set()
+        self.pair_modes = {}
+        self.current_source_image = None
+        self.current_source_path = None
         self._reset_thumbnail_state()
-        self._start_jpeg_preload([path for path in paths if path.suffix.lower() in JPEG_EXTENSIONS])
+        # Increment the preload generation and discard the previous folder's
+        # memory cache while the new tree is being enumerated.
+        self._start_jpeg_preload([])
+        self.folder_label.configure(text=f"正在扫描：{folder.name or str(folder)}")
+        self._set_status("正在扫描：已发现 0 张照片，已访问 0 个文件夹")
+        self._show_preview_message("正在扫描照片…")
+        self._scan_future = self._scan_executor.submit(self._scan_folder_worker, generation, folder)
+
+    def _scan_folder_worker(self, generation: int, folder: Path) -> None:
+        def report(found: int, directories: int, skipped_links: int, errors: int) -> None:
+            if generation == self._scan_generation:
+                self._scan_events.put((generation, "progress", (found, directories, skipped_links, errors)))
+
+        try:
+            result = scan_photo_tree(
+                folder,
+                progress=report,
+                should_cancel=lambda: generation != self._scan_generation,
+            )
+        except Exception as exc:  # Keep an unexpected filesystem error on the UI thread.
+            if generation == self._scan_generation:
+                self._scan_events.put((generation, "error", exc))
+            return
+        if not result.cancelled and generation == self._scan_generation:
+            self._scan_events.put((generation, "done", result))
+
+    def _poll_scan_events(self) -> None:
+        generation = self._scan_generation
+        latest_progress: tuple[int, int, int, int] | None = None
+        completed: ScanResult | None = None
+        failure: Exception | None = None
+        while True:
+            try:
+                event_generation, kind, payload = self._scan_events.get_nowait()
+            except queue.Empty:
+                break
+            if event_generation != generation:
+                continue
+            if kind == "progress":
+                latest_progress = payload  # type: ignore[assignment]
+            elif kind == "done":
+                completed = payload  # type: ignore[assignment]
+            elif kind == "error" and isinstance(payload, Exception):
+                failure = payload
+
+        if latest_progress is not None and completed is None and failure is None:
+            found, directories, skipped_links, errors = latest_progress
+            self._set_status(f"正在扫描：已发现 {found} 张照片，已访问 {directories} 个文件夹")
+            detail = []
+            if skipped_links:
+                detail.append(f"跳过链接 {skipped_links}")
+            if errors:
+                detail.append(f"读取异常 {errors}")
+            self.preload_label.configure(text="；".join(detail))
+
+        if failure is not None:
+            self._scan_future = None
+            self._scan_folder = None
+            self.preload_label.configure(text="")
+            messagebox.showerror(APP_NAME, f"无法扫描这个文件夹：\n{failure}")
+
+        if completed is not None:
+            self._scan_future = None
+            folder = self._scan_folder
+            self._scan_folder = None
+            if folder is not None:
+                self._apply_scan_result(folder, completed)
+
+        if self.winfo_exists():
+            self._scan_poll_job = self.after(60, self._poll_scan_events)
+
+    def _apply_scan_result(self, folder: Path, result: ScanResult) -> None:
+        """Install one complete, sorted scan snapshot on the Tk thread."""
+        self.folder = folder
+        paths = sorted(result.paths, key=lambda path: _relative_path_sort_key(path, folder))
+        self.all_items = build_photo_groups(list(paths), root=folder)
         saved, saved_pair_modes = self._load_selection()
         current_keys = {item.key for item in self.all_items}
         self.kept = saved.intersection(current_keys)
@@ -507,11 +751,19 @@ class PhotoCuller(tk.Tk):
             key: mode for key, mode in saved_pair_modes.items() if key in pair_keys and mode in {"both", "raw", "jpg"}
         }
         self.folder_label.configure(text=folder.name or str(folder))
+        notices = []
+        if result.skipped_links:
+            notices.append(f"跳过链接目录/文件 {result.skipped_links} 个")
+        if result.errors:
+            notices.append(f"跳过读取异常 {len(result.errors)} 项")
+        self._scan_notice = "    " + "；".join(notices) if notices else ""
+        jpeg_paths = [path for path in paths if path.suffix.casefold() in JPEG_EXTENSIONS]
+        self._start_jpeg_preload(jpeg_paths)
         if not self.all_items:
             self.current_source_image = None
             self.current_source_path = None
             self._show_preview_message("这个文件夹中没有受支持的照片")
-            self._set_status("支持 JPG、JPEG、PNG、TIFF、DNG")
+            self._set_status("支持 JPG、JPEG、PNG、TIFF、DNG" + self._scan_notice)
             self._update_keep_mode_ui()
             self._render_thumbnails()
             return
@@ -548,7 +800,7 @@ class PhotoCuller(tk.Tk):
                 self._render_thumbnails()
                 return
             self.index = min(self.index, len(items) - 1)
-        self._show_current(center=False, reset_zoom=False)
+        self._show_current(center=False)
 
     def cycle_keep_mode(self) -> None:
         item = self.current_item
@@ -580,7 +832,7 @@ class PhotoCuller(tk.Tk):
             self.show_kept_only.set(False)
         self.index = min(self.index, max(len(self.visible_items) - 1, 0))
         if self.visible_items:
-            self._show_current(center=True, reset_zoom=False)
+            self._show_current(center=True)
         else:
             self._show_preview_message("打开一个照片文件夹开始选片")
             self._update_keep_mode_ui()
@@ -618,28 +870,35 @@ class PhotoCuller(tk.Tk):
             return
         self._show_current(center=True)
 
-    def _show_current(self, center: bool, reset_zoom: bool = True) -> None:
+    def _display_path(self, path: Path) -> str:
+        """Prefer a root-relative path so duplicate names in subfolders are clear."""
+        if self.folder is not None:
+            try:
+                return str(path.relative_to(self.folder))
+            except ValueError:
+                pass
+        return path.name
+
+    def _show_current(self, center: bool) -> None:
         item = self.current_item
         if item is None:
             return
         path = item.primary
+        display_path = self._display_path(path)
         self._cancel_preview_jobs()
-        self._set_status("正在载入：" + path.name)
+        self._set_status("正在载入：" + display_path)
         self.update_idletasks()
         try:
-            if self.current_source_path != path or self.current_source_image is None:
-                with self._preview_levels_lock:
-                    self._preview_levels.clear()
+            path_changed = self.current_source_path != path or self.current_source_image is None
+            if path_changed:
+                self._cancel_zoom_animation()
                 self.current_source_image = self._load_image(path, thumbnail=False)
                 self.current_source_path = path
-            # A fast screen-resolution frame appears first. The original pixels
-            # are then resampled with Lanczos in the background once idle.
-            self._render_preview(reset_zoom=reset_zoom, interactive=True)
-            self._schedule_preview_render(interactive=False, quality_delay=90)
+            self._render_preview(reset_view=path_changed)
         except Exception as exc:  # Do not stop an entire culling session for one bad image.
             self.current_source_image = None
             self.current_source_path = None
-            self._show_preview_message(f"无法显示\n{path.name}\n\n{exc}")
+            self._show_preview_message(f"无法显示\n{display_path}\n\n{exc}")
         self._set_status(self._status_text(item))
         self._update_keep_mode_ui()
         self._render_thumbnails(center=center)
@@ -695,6 +954,7 @@ class PhotoCuller(tk.Tk):
         return image.resize(size, Image.Resampling.LANCZOS)
 
     def _show_preview_message(self, message: str) -> None:
+        self._cancel_zoom_animation()
         self._cancel_preview_jobs()
         self.preview_photo = None
         self.preview_image_item = None
@@ -713,95 +973,87 @@ class PhotoCuller(tk.Tk):
             justify="center",
         )
         self.preview_canvas.configure(cursor="arrow")
-        self.zoom_label.configure(text="—")
+        if hasattr(self, "zoom_label"):
+            self.zoom_label.configure(text="—")
 
-    def _render_preview(self, reset_zoom: bool, interactive: bool = False) -> None:
-        """Render one immediate frame; deferred frames use the background worker."""
-        image = self.current_source_image
-        path = self.current_source_path
-        if image is None or path is None:
-            return
-        geometry = self._preview_geometry(reset_zoom=reset_zoom, interactive=interactive)
-        frame = self._build_preview_frame(image, path, geometry, interactive)
-        self._apply_preview_frame(frame, geometry)
-
-    def _preview_geometry(self, reset_zoom: bool, interactive: bool) -> PreviewGeometry:
-        """Calculate an oversized source crop so normal drags need no rerender."""
+    def _render_preview(self, reset_view: bool = False) -> None:
+        """Render one Bicubic viewport immediately."""
         image = self.current_source_image
         if image is None:
-            raise RuntimeError("没有可显示的照片")
+            return
+        geometry = self._preview_geometry(image, reset_view=reset_view)
+        frame = self._build_preview_frame(image, geometry)
+        self._apply_preview_frame(frame, geometry)
+        self._update_zoom_label()
+        self._update_preview_cursor()
+
+    def _sync_fit_scale(self, image: Image.Image, reset_view: bool = False) -> tuple[int, int]:
+        """Update the fit scale while preserving an intentional magnified view."""
         canvas_width = max(self.preview_canvas.winfo_width(), 1)
         canvas_height = max(self.preview_canvas.winfo_height(), 1)
         previous_fit = self.fit_scale
         new_fit = min(canvas_width / image.width, canvas_height / image.height, 1.0)
-        was_at_fit = abs(self.zoom_scale - previous_fit) < 0.0001
+        was_at_fit = (
+            abs(self.zoom_scale - previous_fit) <= 0.0001
+            and abs(self.zoom_target_scale - previous_fit) <= 0.0001
+        )
         self.fit_scale = new_fit
-        if reset_zoom or was_at_fit:
+        if reset_view or was_at_fit:
             self.zoom_scale = new_fit
+            self.zoom_target_scale = new_fit
             self.pan_x = 0.0
             self.pan_y = 0.0
         else:
-            self.zoom_scale = max(new_fit, min(4.0, self.zoom_scale))
+            self.zoom_scale = clamp_zoom_scale(self.zoom_scale, new_fit)
+            self.zoom_target_scale = clamp_zoom_scale(self.zoom_target_scale, new_fit)
         self._constrain_pan(canvas_width, canvas_height)
+        return canvas_width, canvas_height
 
-        display_width = image.width * self.zoom_scale
-        display_height = image.height * self.zoom_scale
+    def _preview_geometry(self, image: Image.Image, reset_view: bool = False) -> PreviewGeometry:
+        """Calculate the visible source crop plus a small drag buffer."""
+        canvas_width, canvas_height = self._sync_fit_scale(image, reset_view=reset_view)
+        scale = max(self.zoom_scale, 1e-9)
+        display_width = image.width * scale
+        display_height = image.height * scale
         left = canvas_width / 2 + self.pan_x - display_width / 2
         top = canvas_height / 2 + self.pan_y - display_height / 2
-        overscan = min(max(canvas_width, canvas_height) * PREVIEW_OVERSCAN, PREVIEW_OVERSCAN_MAX_PX)
-        source_left = max(0, math.floor((-overscan - left) / self.zoom_scale))
-        source_top = max(0, math.floor((-overscan - top) / self.zoom_scale))
-        source_right = min(image.width, math.ceil((canvas_width + overscan - left) / self.zoom_scale))
-        source_bottom = min(image.height, math.ceil((canvas_height + overscan - top) / self.zoom_scale))
-        if source_right <= source_left or source_bottom <= source_top:
-            raise RuntimeError("无法显示这个缩放区域")
 
-        factor = self._interactive_downsample_factor(image) if interactive else 1
-        level_left = max(0, source_left // factor)
-        level_top = max(0, source_top // factor)
-        level_right = min(math.ceil(image.width / factor), math.ceil(source_right / factor))
-        level_bottom = min(math.ceil(image.height / factor), math.ceil(source_bottom / factor))
-        if level_right <= level_left or level_bottom <= level_top:
-            raise RuntimeError("无法显示这个缩放区域")
-        target_width = max(1, round((level_right - level_left) * self.zoom_scale * factor))
-        target_height = max(1, round((level_bottom - level_top) * self.zoom_scale * factor))
+        overscan = 0.0
+        if scale > self.fit_scale + 0.0001:
+            overscan = min(max(canvas_width, canvas_height) * PREVIEW_OVERSCAN_FRACTION, PREVIEW_OVERSCAN_MAX_PX)
+
+        source_left = max(0, math.floor((-overscan - left) / scale))
+        source_top = max(0, math.floor((-overscan - top) / scale))
+        source_right = min(image.width, math.ceil((canvas_width + overscan - left) / scale))
+        source_bottom = min(image.height, math.ceil((canvas_height + overscan - top) / scale))
+        source_left = min(source_left, image.width - 1)
+        source_top = min(source_top, image.height - 1)
+        source_right = max(source_left + 1, source_right)
+        source_bottom = max(source_top + 1, source_bottom)
+        target_size = (
+            max(1, round((source_right - source_left) * scale)),
+            max(1, round((source_bottom - source_top) * scale)),
+        )
         return PreviewGeometry(
-            source_box=(level_left, level_top, level_right, level_bottom),
-            target_size=(target_width, target_height),
-            origin=(left + level_left * factor * self.zoom_scale, top + level_top * factor * self.zoom_scale),
-            downsample_factor=factor,
+            source_box=(source_left, source_top, source_right, source_bottom),
+            target_size=target_size,
+            origin=(
+                left + source_left * scale,
+                top + source_top * scale,
+            ),
         )
 
-    def _interactive_downsample_factor(self, image: Image.Image) -> int:
-        """Choose a pyramid level close to screen resolution for responsive input."""
-        factor = 1
-        max_factor = min(16, max(1, min(image.width, image.height)))
-        while factor * 2 <= max_factor and self.zoom_scale * factor * 2 <= 1.0:
-            factor *= 2
-        return factor
-
-    def _preview_source_for(self, image: Image.Image, path: Path, factor: int, interactive: bool) -> Image.Image:
-        if factor == 1:
+    @staticmethod
+    def _build_preview_frame(image: Image.Image, geometry: PreviewGeometry) -> Image.Image:
+        full_box = (0, 0, image.width, image.height)
+        if geometry.source_box == full_box and image.size == geometry.target_size:
             return image
-        key = (str(path.resolve()), factor)
-        with self._preview_levels_lock:
-            cached = self._preview_levels.get(key)
-        if cached is not None:
-            return cached
-        size = (max(1, math.ceil(image.width / factor)), max(1, math.ceil(image.height / factor)))
-        level = image.resize(size, Image.Resampling.BILINEAR if interactive else Image.Resampling.LANCZOS)
-        with self._preview_levels_lock:
-            return self._preview_levels.setdefault(key, level)
-
-    def _build_preview_frame(self, image: Image.Image, path: Path, geometry: PreviewGeometry, interactive: bool) -> Image.Image:
-        source = self._preview_source_for(image, path, geometry.downsample_factor, interactive)
-        crop = source.crop(geometry.source_box)
-        if crop.size != geometry.target_size:
-            crop = crop.resize(
-                geometry.target_size,
-                Image.Resampling.BILINEAR if interactive else Image.Resampling.LANCZOS,
-            )
-        return crop
+        return image.resize(
+            geometry.target_size,
+            PREVIEW_RESAMPLING_FILTER,
+            box=geometry.source_box,
+            reducing_gap=PREVIEW_REDUCING_GAP,
+        )
 
     def _apply_preview_frame(self, frame: Image.Image, geometry: PreviewGeometry) -> None:
         self.preview_photo = ImageTk.PhotoImage(frame)
@@ -819,58 +1071,50 @@ class PhotoCuller(tk.Tk):
             self.preview_canvas.coords(self.preview_image_item, round(geometry.origin[0]), round(geometry.origin[1]))
         self._preview_item_origin = geometry.origin
         self._preview_item_size = frame.size
-        self._update_zoom_label()
-        self.preview_canvas.configure(cursor="fleur" if self.zoom_scale > self.fit_scale + 0.0001 else "arrow")
 
     def _cancel_preview_jobs(self) -> None:
-        if self._interactive_render_job is not None:
-            self.after_cancel(self._interactive_render_job)
-            self._interactive_render_job = None
-        if self._quality_render_job is not None:
-            self.after_cancel(self._quality_render_job)
-            self._quality_render_job = None
+        if self._preview_render_job is not None:
+            try:
+                self.after_cancel(self._preview_render_job)
+            except tk.TclError:
+                pass
+            self._preview_render_job = None
         self._preview_render_generation += 1
         for future in self._preview_futures:
             future.cancel()
         self._preview_futures.clear()
 
-    def _schedule_preview_render(self, interactive: bool = True, quality_delay: int = PREVIEW_QUALITY_DELAY_MS) -> None:
-        """Coalesce input; only the newest viewport is allowed to reach the canvas."""
+    def _schedule_preview_render(self, delay: int = PREVIEW_RENDER_DELAY_MS) -> None:
+        """Coalesce view changes so only the newest viewport reaches Tk."""
         self._preview_render_generation += 1
         for future in self._preview_futures:
             future.cancel()
         self._preview_futures = {future for future in self._preview_futures if not future.done()}
-        if self._interactive_render_job is not None:
-            self.after_cancel(self._interactive_render_job)
-        if self._quality_render_job is not None:
-            self.after_cancel(self._quality_render_job)
-        self._interactive_render_job = None
-        self._quality_render_job = None
-        if interactive:
-            self._interactive_render_job = self.after(PREVIEW_INTERACTIVE_DELAY_MS, self._render_interactive_frame)
-        self._quality_render_job = self.after(quality_delay, self._render_quality_frame)
+        if self._preview_render_job is not None:
+            try:
+                self.after_cancel(self._preview_render_job)
+            except tk.TclError:
+                pass
+        generation = self._preview_render_generation
+        self._preview_render_job = self.after(
+            max(0, int(delay)),
+            lambda generation=generation: self._request_preview_render(generation),
+        )
 
-    def _render_interactive_frame(self) -> None:
-        self._interactive_render_job = None
-        self._request_preview_render(interactive=True)
-
-    def _render_quality_frame(self) -> None:
-        self._quality_render_job = None
-        self._request_preview_render(interactive=False)
-
-    def _request_preview_render(self, interactive: bool) -> None:
-        """Crop and resample outside Tk's event loop; only Tk image creation stays on the UI thread."""
+    def _request_preview_render(self, generation: int) -> None:
+        """Resize outside Tk's event loop; only Tk image creation stays on the UI thread."""
+        self._preview_render_job = None
+        if generation != self._preview_render_generation:
+            return
         image = self.current_source_image
         path = self.current_source_path
         if image is None or path is None:
             return
-        self._preview_render_generation += 1
-        generation = self._preview_render_generation
         for future in self._preview_futures:
             future.cancel()
         self._preview_futures = {future for future in self._preview_futures if not future.done()}
         try:
-            geometry = self._preview_geometry(reset_zoom=False, interactive=interactive)
+            geometry = self._preview_geometry(image, reset_view=False)
         except Exception:
             return
         future = self._preview_executor.submit(
@@ -878,9 +1122,7 @@ class PhotoCuller(tk.Tk):
             generation,
             str(path.resolve()),
             image,
-            path,
             geometry,
-            interactive,
         )
         self._preview_futures.add(future)
 
@@ -889,12 +1131,10 @@ class PhotoCuller(tk.Tk):
         generation: int,
         path_key: str,
         image: Image.Image,
-        path: Path,
         geometry: PreviewGeometry,
-        interactive: bool,
     ) -> None:
         try:
-            frame = self._build_preview_frame(image, path, geometry, interactive)
+            frame = self._build_preview_frame(image, geometry)
             self._preview_render_events.put((generation, path_key, frame, geometry, None))
         except Exception as exc:
             self._preview_render_events.put((generation, path_key, None, None, exc))
@@ -929,61 +1169,139 @@ class PhotoCuller(tk.Tk):
         self.pan_y = max(-max_y, min(max_y, self.pan_y))
 
     def _update_zoom_label(self) -> None:
+        if not hasattr(self, "zoom_label"):
+            return
         if self.current_source_image is None:
             self.zoom_label.configure(text="—")
             return
         percent = round(self.zoom_scale * 100)
-        if abs(self.zoom_scale - self.fit_scale) < 0.0001:
+        if abs(self.zoom_scale - self.fit_scale) <= 0.0001:
             self.zoom_label.configure(text=f"适合 {percent}%")
         else:
             self.zoom_label.configure(text=f"{percent}%")
 
-    def _set_zoom(self, scale: float, anchor: tuple[float, float] | None = None) -> None:
+    def _update_preview_cursor(self) -> None:
+        cursor = "fleur" if self.zoom_scale > self.fit_scale + 0.0001 else "arrow"
+        self.preview_canvas.configure(cursor=cursor)
+
+    def _cancel_zoom_animation(self) -> None:
+        if self._zoom_animation_job is not None:
+            try:
+                self.after_cancel(self._zoom_animation_job)
+            except tk.TclError:
+                pass
+        self._zoom_animation_job = None
+        self._zoom_animation_last_time = None
+        self.zoom_target_scale = self.zoom_scale
+        self._zoom_anchor = None
+
+    def _capture_zoom_anchor(self, anchor: tuple[float, float]) -> None:
+        """Remember which source pixel is currently under the pointer."""
         image = self.current_source_image
         if image is None:
             return
         canvas_width = max(self.preview_canvas.winfo_width(), 1)
         canvas_height = max(self.preview_canvas.winfo_height(), 1)
         self._constrain_pan(canvas_width, canvas_height)
-        old_scale = self.zoom_scale
-        new_scale = max(self.fit_scale, min(4.0, scale))
-        if abs(new_scale - old_scale) < 0.000001:
+        scale = max(self.zoom_scale, 1e-9)
+        left = canvas_width / 2 + self.pan_x - image.width * scale / 2
+        top = canvas_height / 2 + self.pan_y - image.height * scale / 2
+        anchor_x, anchor_y = anchor
+        source_x = (anchor_x - left) / scale
+        source_y = (anchor_y - top) / scale
+        if not (0.0 <= source_x <= image.width and 0.0 <= source_y <= image.height):
+            anchor_x = canvas_width / 2
+            anchor_y = canvas_height / 2
+            source_x = image.width / 2
+            source_y = image.height / 2
+        self._zoom_anchor = (anchor_x, anchor_y, source_x, source_y)
+
+    def _apply_zoom_anchor(self) -> None:
+        image = self.current_source_image
+        anchor = self._zoom_anchor
+        if image is None or anchor is None:
             return
-        if anchor is not None:
-            anchor_x, anchor_y = anchor
-            old_left = canvas_width / 2 + self.pan_x - image.width * old_scale / 2
-            old_top = canvas_height / 2 + self.pan_y - image.height * old_scale / 2
-            source_x = max(0.0, min(float(image.width), (anchor_x - old_left) / old_scale))
-            source_y = max(0.0, min(float(image.height), (anchor_y - old_top) / old_scale))
-            self.pan_x = anchor_x - source_x * new_scale - canvas_width / 2 + image.width * new_scale / 2
-            self.pan_y = anchor_y - source_y * new_scale - canvas_height / 2 + image.height * new_scale / 2
-        self.zoom_scale = new_scale
-        self._schedule_preview_render()
+        canvas_width = max(self.preview_canvas.winfo_width(), 1)
+        canvas_height = max(self.preview_canvas.winfo_height(), 1)
+        anchor_x, anchor_y, source_x, source_y = anchor
+        self.pan_x = anchor_x - canvas_width / 2 - (source_x - image.width / 2) * self.zoom_scale
+        self.pan_y = anchor_y - canvas_height / 2 - (source_y - image.height / 2) * self.zoom_scale
+        self._constrain_pan(canvas_width, canvas_height)
+
+    def _start_zoom_animation(self) -> None:
+        if self._zoom_animation_job is not None:
+            return
+        self._zoom_animation_last_time = monotonic()
+        self._zoom_last_render_at = 0.0
+        self._zoom_animation_job = self.after(ZOOM_ANIMATION_INTERVAL_MS, self._animate_zoom)
+
+    def _animate_zoom(self) -> None:
+        self._zoom_animation_job = None
+        if self.current_source_image is None:
+            self._cancel_zoom_animation()
+            return
+        now = monotonic()
+        previous_time = self._zoom_animation_last_time or now
+        self._zoom_animation_last_time = now
+        next_scale = advance_zoom_scale(self.zoom_scale, self.zoom_target_scale, now - previous_time)
+        settled = abs(self.zoom_target_scale - next_scale) <= max(
+            self.zoom_target_scale * ZOOM_SETTLE_RELATIVE_EPSILON,
+            0.00001,
+        )
+        self.zoom_scale = self.zoom_target_scale if settled else next_scale
+        self.zoom_scale = clamp_zoom_scale(self.zoom_scale, self.fit_scale)
+        self._apply_zoom_anchor()
+        self._update_zoom_label()
+        self._update_preview_cursor()
+
+        if settled or now - self._zoom_last_render_at >= ZOOM_RENDER_INTERVAL_MS / 1000.0:
+            self._zoom_last_render_at = now
+            self._schedule_preview_render(delay=0)
+
+        if settled:
+            self._zoom_animation_last_time = None
+            self._zoom_anchor = None
+            return
+        self._zoom_animation_job = self.after(ZOOM_ANIMATION_INTERVAL_MS, self._animate_zoom)
+
+    def _set_zoom_target(self, scale: float, anchor: tuple[float, float]) -> None:
+        image = self.current_source_image
+        if image is None:
+            return
+        self._sync_fit_scale(image, reset_view=False)
+        target = clamp_zoom_scale(scale, self.fit_scale)
+        if abs(target - self.zoom_target_scale) <= 0.000001 and self._zoom_animation_job is None:
+            return
+        self._capture_zoom_anchor(anchor)
+        self.zoom_target_scale = target
+        self._start_zoom_animation()
 
     def zoom_fit(self) -> None:
         if self.current_source_image is None:
             return
-        self.zoom_scale = self.fit_scale
-        self.pan_x = 0.0
-        self.pan_y = 0.0
+        self._cancel_zoom_animation()
         self._cancel_preview_jobs()
-        self._render_preview(reset_zoom=False, interactive=True)
-        self._schedule_preview_render(interactive=False, quality_delay=80)
+        self._render_preview(reset_view=True)
 
     def zoom_actual(self) -> None:
-        if self.current_source_image is None:
+        image = self.current_source_image
+        if image is None:
             return
-        self.zoom_scale = max(self.fit_scale, 1.0)
+        self._cancel_zoom_animation()
+        self._sync_fit_scale(image, reset_view=False)
+        self.zoom_scale = clamp_zoom_scale(1.0, self.fit_scale)
+        self.zoom_target_scale = self.zoom_scale
         self.pan_x = 0.0
         self.pan_y = 0.0
         self._cancel_preview_jobs()
-        self._render_preview(reset_zoom=False, interactive=True)
-        self._schedule_preview_render(interactive=False, quality_delay=80)
+        self._render_preview(reset_view=False)
 
     def toggle_zoom(self) -> None:
-        if self.current_source_image is None:
+        image = self.current_source_image
+        if image is None:
             return
-        if abs(self.zoom_scale - self.fit_scale) < 0.0001:
+        self._sync_fit_scale(image, reset_view=False)
+        if abs(self.zoom_target_scale - self.fit_scale) <= 0.0001:
             self.zoom_actual()
         else:
             self.zoom_fit()
@@ -991,21 +1309,26 @@ class PhotoCuller(tk.Tk):
     def zoom_step(self, direction: int) -> None:
         if self.current_source_image is None:
             return
-        factor = 1.25 if direction > 0 else 1 / 1.25
         center = (self.preview_canvas.winfo_width() / 2, self.preview_canvas.winfo_height() / 2)
-        self._set_zoom(self.zoom_scale * factor, center)
+        factor = ZOOM_FACTOR_PER_STEP if direction > 0 else 1 / ZOOM_FACTOR_PER_STEP
+        self._set_zoom_target(self.zoom_target_scale * factor, center)
 
     def _preview_mouse_wheel(self, event: tk.Event) -> str:
         if self.current_source_image is None or event.delta == 0:
             return "break"
-        steps = event.delta / 120
-        self._set_zoom(self.zoom_scale * (1.25 ** steps), (event.x, event.y))
+        image = self.current_source_image
+        self._sync_fit_scale(image, reset_view=False)
+        target = zoom_target_after_wheel(self.zoom_target_scale, event.delta / 120.0, self.fit_scale)
+        self._set_zoom_target(target, (event.x, event.y))
         return "break"
 
     def _preview_drag_start(self, event: tk.Event) -> None:
+        self._cancel_zoom_animation()
         if self.current_source_image is None or self.zoom_scale <= self.fit_scale + 0.0001:
             self._drag_state = None
             return
+        self._cancel_preview_jobs()
+        self._render_preview(reset_view=False)
         self._drag_state = (event.x, event.y, self.pan_x, self.pan_y)
 
     def _preview_drag_motion(self, event: tk.Event) -> None:
@@ -1017,33 +1340,46 @@ class PhotoCuller(tk.Tk):
         self.pan_y = start_pan_y + event.y - start_y
         self._constrain_pan(max(self.preview_canvas.winfo_width(), 1), max(self.preview_canvas.winfo_height(), 1))
         self._move_preview_item(self.pan_x - previous_pan_x, self.pan_y - previous_pan_y)
-        if self._preview_frame_needs_refresh():
-            self._schedule_preview_render(interactive=True, quality_delay=180)
-        else:
-            self._schedule_preview_render(interactive=False, quality_delay=180)
+        delay = 0 if self._preview_frame_needs_refresh() else PREVIEW_DRAG_RENDER_DELAY_MS
+        self._schedule_preview_render(delay=delay)
 
     def _preview_drag_end(self, _event: tk.Event) -> None:
+        if self._drag_state is None:
+            return
         self._drag_state = None
-        self._schedule_preview_render(interactive=True, quality_delay=70)
+        self._schedule_preview_render(delay=0)
 
     def _move_preview_item(self, dx: float, dy: float) -> None:
-        if self.preview_image_item is None or (dx == 0 and dy == 0):
+        if self.preview_image_item is None or (abs(dx) < 0.001 and abs(dy) < 0.001):
             return
         self.preview_canvas.move(self.preview_image_item, dx, dy)
         if self._preview_item_origin is not None:
             self._preview_item_origin = (self._preview_item_origin[0] + dx, self._preview_item_origin[1] + dy)
 
     def _preview_frame_needs_refresh(self) -> bool:
-        if self.preview_image_item is None:
+        image = self.current_source_image
+        if image is None or self.preview_image_item is None:
             return True
         bounds = self.preview_canvas.bbox(self.preview_image_item)
         if bounds is None:
             return True
         canvas_width = max(self.preview_canvas.winfo_width(), 1)
         canvas_height = max(self.preview_canvas.winfo_height(), 1)
-        safety = max(80, round(max(canvas_width, canvas_height) * 0.15))
-        left, top, right, bottom = bounds
-        return left > -safety or top > -safety or right < canvas_width + safety or bottom < canvas_height + safety
+        display_width = image.width * self.zoom_scale
+        display_height = image.height * self.zoom_scale
+        display_left = canvas_width / 2 + self.pan_x - display_width / 2
+        display_top = canvas_height / 2 + self.pan_y - display_height / 2
+        visible_left = max(0.0, display_left)
+        visible_top = max(0.0, display_top)
+        visible_right = min(float(canvas_width), display_left + display_width)
+        visible_bottom = min(float(canvas_height), display_top + display_height)
+        frame_left, frame_top, frame_right, frame_bottom = bounds
+        return (
+            frame_left > visible_left + 1
+            or frame_top > visible_top + 1
+            or frame_right < visible_right - 1
+            or frame_bottom < visible_bottom - 1
+        )
 
     def _start_jpeg_preload(self, jpeg_paths: list[Path]) -> None:
         """Decode all JPEGs in a worker so later navigation does not wait for disk I/O."""
@@ -1237,9 +1573,10 @@ class PhotoCuller(tk.Tk):
         if item.paired_raw_jpeg:
             mode_text = self._pair_mode_label(self._pair_mode(item)) if item.key in self.kept else "未保留"
         self.thumb_canvas.itemconfigure(entry.mode_id, text=mode_text)
-        label = item.primary.name
+        label = self._display_path(item.primary)
         if len(label) > 18:
-            label = label[:16] + "…"
+            # Keep the filename end visible when a nested relative path is long.
+            label = "…" + label[-17:]
         self.thumb_canvas.itemconfigure(entry.label_id, text=label)
 
         photo = self._thumbnail_cache_get(cache_key)
@@ -1388,11 +1725,11 @@ class PhotoCuller(tk.Tk):
 
     def _refresh_after_resize(self) -> None:
         self._resize_job = None
-        # Keep the current zoom state and avoid reopening a DNG while the layout is settling.
+        # Keep the current source image and redraw only after the layout settles.
         if self.current_source_image is not None and self.preview_photo is not None:
+            self._cancel_zoom_animation()
             self._cancel_preview_jobs()
-            self._render_preview(reset_zoom=False, interactive=True)
-            self._schedule_preview_render(interactive=False, quality_delay=90)
+            self._schedule_preview_render(delay=0)
 
     def export_kept(self) -> None:
         if not self.kept:
@@ -1511,16 +1848,26 @@ class PhotoCuller(tk.Tk):
 
     def _status_text(self, item: PhotoGroup | None) -> str:
         if item is None:
-            return f"保留 {len(self.kept)} 张照片"
+            return f"保留 {len(self.kept)} 张照片" + self._scan_notice
         prefix = "★ 已保留" if item.key in self.kept else "未保留"
         paired = f"    绑定组：{self._pair_mode_label(self._pair_mode(item))}" if item.paired_raw_jpeg and item.key in self.kept else ("    RAW+JPG 绑定组" if item.paired_raw_jpeg else "")
-        return f"{self.index + 1} / {len(self.visible_items)}    {prefix}    已保留 {len(self.kept)} 个项目{paired}    {item.primary.name}"
+        return f"{self.index + 1} / {len(self.visible_items)}    {prefix}    已保留 {len(self.kept)} 个项目{paired}    {self._display_path(item.primary)}{self._scan_notice}"
 
     def _set_status(self, text: str) -> None:
         self.status_label.configure(text=text)
 
     def _on_close(self) -> None:
         """Stop background preview jobs before Tk tears down its image runtime."""
+        self._scan_generation += 1
+        if self._scan_future is not None:
+            self._scan_future.cancel()
+            self._scan_future = None
+        if getattr(self, "_scan_poll_job", None) is not None:
+            try:
+                self.after_cancel(self._scan_poll_job)
+            except tk.TclError:
+                pass
+        self._cancel_zoom_animation()
         self._cancel_preview_jobs()
         self._cancel_thumbnail_jobs()
         if getattr(self, "_preview_poll_job", None) is not None:
@@ -1535,6 +1882,7 @@ class PhotoCuller(tk.Tk):
                 pass
         self._preview_executor.shutdown(wait=False, cancel_futures=True)
         self._thumbnail_executor.shutdown(wait=False, cancel_futures=True)
+        self._scan_executor.shutdown(wait=False, cancel_futures=True)
         self.destroy()
 
 
