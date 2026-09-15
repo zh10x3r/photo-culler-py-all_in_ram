@@ -1,4 +1,4 @@
-注：这个仓库的内容与 https://github.com/cH3nj4c/photo-culler-py 为两个分支.
+注：这个仓库的内容与 https://github.com/cH3nj4c/photo-culler-py 为两个分支,分别进行维护和功能构建。
 
 # Photo Culler（摄影选片）
 
