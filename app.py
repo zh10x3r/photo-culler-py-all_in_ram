@@ -85,6 +85,7 @@ try:
         QMainWindow,
         QMessageBox,
         QPushButton,
+        QScrollArea,
         QSizePolicy,
         QSplitter,
         QStyledItemDelegate,
@@ -115,6 +116,11 @@ JPEG_EXTENSIONS = {".jpg", ".jpeg"}
 SIDEBAR_WIDTH_DEFAULT = 238
 SIDEBAR_WIDTH_MIN = 180
 SIDEBAR_WIDTH_MAX = 420
+# The Qt controls include their keyboard hints and a 10 px vertical scrollbar.
+# Keep enough room for both so the content margins stay symmetric at the
+# narrowest splitter position.  The legacy Tk panel continues to use the
+# original SIDEBAR_WIDTH_MIN value above.
+QT_SIDEBAR_WIDTH_MIN = 220
 SCAN_PROGRESS_MIN_INTERVAL = 0.08
 PREVIEW_RENDER_DELAY_MS = 90
 PREVIEW_RESAMPLING_FILTER = Image.Resampling.BICUBIC
@@ -3192,18 +3198,43 @@ if QT_PHOTO_CULLER_AVAILABLE:
             self.setMinimumSize(900, 620)
             self.setStyleSheet(
                 """
-                QMainWindow, QWidget { background: #17191d; color: #e7e9ed; }
-                QFrame#toolbar, QFrame#info, QFrame#sidebar { background: #202329; }
-                QLabel { color: #e7e9ed; }
-                QLabel#muted { color: #a8adb7; }
-                QLabel#header { color: #e7e9ed; font-size: 14px; font-weight: 600; }
-                QPushButton { min-height: 31px; padding: 4px 9px; }
-                QPushButton#keepButton { font-weight: 600; min-height: 36px; }
-                QGroupBox { border: 1px solid #343944; border-radius: 4px; margin-top: 10px; padding-top: 8px; }
-                QGroupBox::title { subcontrol-origin: margin; left: 8px; padding: 0 4px; color: #e7e9ed; }
-                QComboBox, QCheckBox { min-height: 27px; }
-                QSplitter::handle { background: #343944; }
-                QScrollBar:horizontal { height: 12px; background: #17191d; }
+                QMainWindow, QWidget { background: #12171e; color: #e7edf7; font-family: "Segoe UI"; font-size: 10pt; }
+                QFrame#toolbar, QFrame#info { background: #1b222b; border: 1px solid #2c3745; border-radius: 8px; }
+                QFrame#sidebar { background: #1b222b; border: 1px solid #2c3745; border-radius: 8px; }
+                QWidget#gpuPreview { background: #0d1015; border: 1px solid #2c3745; border-radius: 8px; }
+                QListView#thumbnailView { background: #171d25; border: 1px solid #2c3745; border-radius: 8px; padding: 4px; outline: 0; }
+                QListView#thumbnailView::item:selected { background: transparent; }
+                QLabel { color: #e7edf7; }
+                QLabel#muted { color: #9da9b8; }
+                QLabel#header { color: #f2f6fc; font-size: 14px; font-weight: 600; }
+                QPushButton { background: #273341; border: 1px solid #3a4a5d; border-radius: 6px; color: #edf4ff; min-height: 31px; padding: 5px 10px; }
+                QPushButton:hover { background: #314154; border-color: #5aa9ff; }
+                QPushButton:pressed { background: #1f2a36; }
+                QPushButton:disabled { background: #20262e; border-color: #2b333d; color: #687384; }
+                QPushButton#keepButton { background: #28516b; border-color: #4f9cff; font-weight: 600; min-height: 37px; }
+                QPushButton#keepButton:hover { background: #326581; }
+                QPushButton#sectionToggle { text-align: left; background: #202c39; border-color: #405267; font-weight: 600; }
+                QPushButton#sectionToggle:hover, QPushButton#sectionToggle:checked { background: #294055; border-color: #5aa9ff; }
+                QComboBox { background: #232e3a; border: 1px solid #3a4a5d; border-radius: 5px; min-height: 27px; padding: 2px 8px; }
+                QComboBox:hover { border-color: #5aa9ff; }
+                QComboBox QAbstractItemView { background: #202a35; selection-background-color: #315779; selection-color: #ffffff; border: 1px solid #405267; }
+                QCheckBox { min-height: 27px; spacing: 8px; }
+                QCheckBox::indicator { width: 16px; height: 16px; border: 1px solid #526276; border-radius: 4px; background: #202832; }
+                QCheckBox::indicator:hover { border-color: #5aa9ff; }
+                QCheckBox::indicator:checked { background: #4f9cff; border-color: #6bb1ff; }
+                QFrame#gpuSettingsPanel { background: #171f29; border: 1px solid #344254; border-radius: 7px; }
+                QScrollArea#sidebarScroll { background: transparent; border: 0; }
+                QWidget#sidebarContent { background: transparent; }
+                QSplitter::handle { background: #334154; width: 6px; }
+                QSplitter::handle:hover { background: #5aa9ff; }
+                QScrollBar:horizontal { height: 11px; background: #12171e; border: 0; margin: 2px 8px; }
+                QScrollBar::handle:horizontal { background: #4a5b70; min-width: 45px; border-radius: 5px; }
+                QScrollBar::handle:horizontal:hover { background: #5aa9ff; }
+                QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
+                QScrollBar:vertical { width: 10px; background: #12171e; border: 0; margin: 8px 3px 8px 0; }
+                QScrollBar::handle:vertical { background: #4a5b70; min-height: 38px; border-radius: 5px; }
+                QScrollBar::handle:vertical:hover { background: #5aa9ff; }
+                QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
                 """
             )
 
@@ -3346,9 +3377,28 @@ if QT_PHOTO_CULLER_AVAILABLE:
 
             sidebar = QFrame()
             sidebar.setObjectName("sidebar")
-            sidebar.setMinimumWidth(SIDEBAR_WIDTH_MIN)
+            sidebar.setMinimumWidth(QT_SIDEBAR_WIDTH_MIN)
             sidebar.setMaximumWidth(SIDEBAR_WIDTH_MAX)
-            sidebar_layout = QVBoxLayout(sidebar)
+            sidebar_shell_layout = QVBoxLayout(sidebar)
+            sidebar_shell_layout.setContentsMargins(0, 0, 0, 0)
+            sidebar_shell_layout.setSpacing(0)
+
+            # Keep the splitter child fixed/resizable while letting the controls
+            # scroll vertically when the GPU panel or a smaller window makes the
+            # menu taller than the available height.
+            self.sidebar_scroll = QScrollArea(sidebar)
+            self.sidebar_scroll.setObjectName("sidebarScroll")
+            self.sidebar_scroll.setFrameShape(QFrame.Shape.NoFrame)
+            self.sidebar_scroll.setWidgetResizable(True)
+            self.sidebar_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            self.sidebar_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+            self.sidebar_scroll.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+            sidebar_content = QWidget()
+            sidebar_content.setObjectName("sidebarContent")
+            sidebar_content.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+            self.sidebar_content = sidebar_content
+            sidebar_layout = QVBoxLayout(sidebar_content)
             sidebar_layout.setContentsMargins(12, 14, 12, 14)
             sidebar_layout.setSpacing(8)
             header = QLabel("操作")
@@ -3377,8 +3427,23 @@ if QT_PHOTO_CULLER_AVAILABLE:
             self.zoom_label.setStyleSheet("color: #8bd7ff; font-weight: 600;")
             sidebar_layout.addWidget(self.zoom_label)
 
-            gpu_group = QGroupBox("GPU 预览设置")
+            self.gpu_settings_toggle = QPushButton("GPU 预览设置  ▸")
+            self.gpu_settings_toggle.setObjectName("sectionToggle")
+            self.gpu_settings_toggle.setCheckable(True)
+            self.gpu_settings_toggle.setChecked(False)
+            self.gpu_settings_toggle.toggled.connect(self._toggle_gpu_settings)
+            sidebar_layout.addWidget(self.gpu_settings_toggle)
+            self.gpu_preview_summary_label = QLabel("GPU 主预览 · cubic · 最大 16×")
+            self.gpu_preview_summary_label.setObjectName("muted")
+            self.gpu_preview_summary_label.setContentsMargins(4, 0, 4, 2)
+            sidebar_layout.addWidget(self.gpu_preview_summary_label)
+
+            gpu_group = QFrame()
+            gpu_group.setObjectName("gpuSettingsPanel")
+            gpu_group.setVisible(False)
             gpu_layout = QVBoxLayout(gpu_group)
+            gpu_layout.setContentsMargins(10, 10, 10, 10)
+            gpu_layout.setSpacing(7)
             interpolation_row = QHBoxLayout()
             interpolation_row.addWidget(QLabel("插值"))
             self.gpu_preview_interpolation_combo = QComboBox()
@@ -3400,6 +3465,7 @@ if QT_PHOTO_CULLER_AVAILABLE:
             self.gpu_preview_status_label.setObjectName("muted")
             self.gpu_preview_status_label.setWordWrap(True)
             gpu_layout.addWidget(self.gpu_preview_status_label)
+            self.gpu_settings_panel = gpu_group
             sidebar_layout.addWidget(gpu_group)
             self.gpu_preview_interpolation_combo.currentTextChanged.connect(self._on_gpu_preview_settings_changed)
             self.gpu_preview_smooth_check.toggled.connect(self._on_gpu_preview_settings_changed)
@@ -3414,6 +3480,9 @@ if QT_PHOTO_CULLER_AVAILABLE:
             note.setAlignment(Qt.AlignmentFlag.AlignCenter)
             sidebar_layout.addWidget(note)
 
+            self.sidebar_scroll.setWidget(sidebar_content)
+            sidebar_shell_layout.addWidget(self.sidebar_scroll)
+
             splitter.addWidget(main_column)
             splitter.addWidget(sidebar)
             splitter.setStretchFactor(0, 1)
@@ -3423,6 +3492,21 @@ if QT_PHOTO_CULLER_AVAILABLE:
             splitter.splitterMoved.connect(
                 lambda _pos, _index: QTimer.singleShot(180, self._save_sidebar_from_splitter)
             )
+
+        def _toggle_gpu_settings(self, expanded: bool) -> None:
+            """Expand the optional GPU controls only when the user requests them."""
+            self.gpu_settings_panel.setVisible(bool(expanded))
+            self.gpu_settings_toggle.setText("GPU 预览设置  ▾" if expanded else "GPU 预览设置  ▸")
+            self.gpu_settings_toggle.setToolTip(
+                "收起 GPU 插值、平滑缩放和最大倍率设置"
+                if expanded
+                else "展开 GPU 插值、平滑缩放和最大倍率设置"
+            )
+            if expanded:
+                # Let Qt recalculate the scroll range before bringing the newly
+                # visible settings into view; this keeps the expanded menu usable
+                # even when the window is short or the sidebar is narrow.
+                QTimer.singleShot(0, lambda: self.sidebar_scroll.ensureWidgetVisible(self.gpu_settings_panel))
 
         def _bind_qt_keys(self) -> None:
             def add_shortcut(sequence: str, slot: Callable[[], object]) -> None:
@@ -3449,7 +3533,7 @@ if QT_PHOTO_CULLER_AVAILABLE:
         def _restore_sidebar_width(self) -> None:
             sizes = self.layout_splitter.sizes()
             total = sum(sizes) or self.width()
-            sidebar = max(SIDEBAR_WIDTH_MIN, min(SIDEBAR_WIDTH_MAX, self.sidebar_width))
+            sidebar = max(QT_SIDEBAR_WIDTH_MIN, min(SIDEBAR_WIDTH_MAX, self.sidebar_width))
             main = max(600, total - sidebar)
             self.layout_splitter.setSizes([main, sidebar])
 
@@ -3457,7 +3541,7 @@ if QT_PHOTO_CULLER_AVAILABLE:
             sizes = self.layout_splitter.sizes()
             if len(sizes) < 2 or sizes[1] <= 1:
                 return
-            width = max(SIDEBAR_WIDTH_MIN, min(SIDEBAR_WIDTH_MAX, int(sizes[1])))
+            width = max(QT_SIDEBAR_WIDTH_MIN, min(SIDEBAR_WIDTH_MAX, int(sizes[1])))
             if width != self.sidebar_width:
                 self.sidebar_width = width
                 self._save_sidebar_width()
@@ -3956,6 +4040,10 @@ if QT_PHOTO_CULLER_AVAILABLE:
                 self.gpu_preview_status_label.setText(
                     f"GPU 主预览已启用\n{info.get('renderer', 'unknown')}\nOpenGL {info.get('opengl', 'unknown')}"
                 )
+            if hasattr(self, "gpu_preview_summary_label"):
+                self.gpu_preview_summary_label.setText(
+                    f"GPU 主预览 · {self.gpu_preview_interpolation} · 最大 {self.gpu_preview_max_zoom}×"
+                )
 
         def _gpu_max_magnification(self) -> float:
             try:
@@ -3981,6 +4069,9 @@ if QT_PHOTO_CULLER_AVAILABLE:
             self.preview_widget.set_max_magnification(self._gpu_max_magnification())
             self.gpu_preview_status_label.setText(
                 f"GPU 主预览已启用\n{self.gpu_preview_interpolation} / 最大 {self.gpu_preview_max_zoom}×"
+            )
+            self.gpu_preview_summary_label.setText(
+                f"GPU 主预览 · {self.gpu_preview_interpolation} · 最大 {self.gpu_preview_max_zoom}×"
             )
 
         def export_kept(self) -> None:
@@ -4118,7 +4209,7 @@ if QT_PHOTO_CULLER_AVAILABLE:
                 width = int(data.get("sidebar_width", SIDEBAR_WIDTH_DEFAULT))
             except (ValueError, TypeError):
                 width = SIDEBAR_WIDTH_DEFAULT
-            return max(SIDEBAR_WIDTH_MIN, min(SIDEBAR_WIDTH_MAX, width))
+            return max(QT_SIDEBAR_WIDTH_MIN, min(SIDEBAR_WIDTH_MAX, width))
 
         def _save_sidebar_width(self) -> None:
             data = self._load_settings_data()
