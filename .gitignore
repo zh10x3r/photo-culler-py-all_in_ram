@@ -24,6 +24,7 @@ dist/
 .eggs/
 *.egg
 *.spec
+!Photo Culler.spec
 
 # Photo Culler 本地打包与运行输出
 outputs/

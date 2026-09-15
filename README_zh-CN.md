@@ -6,7 +6,7 @@
 
 1. 运行 `Photo Culler.exe`，选择包含照片的文件夹；软件会递归扫描该文件夹及其普通子文件夹中的照片。
 2. 用 `[` / `]` 切换照片；按 `Space` 标记或取消“保留”。同一文件夹中同名的 `DNG + JPG/JPEG` 会自动合并为一个选片项目，优先显示 JPG。
-3. 下方缩略图中的黄色星号表示已保留；可勾选“只看保留”。底部缩略图栏只维护当前可见范围及前后少量预取项；滚动时复用已有画布项目，缩略图的读取和生成放在后台线程完成，因此照片很多时不会一次创建成百上千个 Tk 图片对象。
+3. 下方缩略图中的黄色星号表示已保留；可勾选“只看保留”。底部使用 Qt `QListView`，由视图只绘制当前可见项并在后台线程生成小尺寸缩略图，因此照片很多时不会一次创建成百上千个界面图片对象。
 4. 按 `E` 或点击“导出保留照片”，选择输出文件夹。软件会复制原始文件，并尽量保留原始拍摄时间等文件属性；被保留的 `DNG + JPG/JPEG` 绑定组会一起导出。
 
 右侧控制栏与预览区域之间的分隔线可以用鼠标拖动，以调整控制栏宽度；软件会记住下次启动时的宽度。
@@ -16,14 +16,25 @@
 ## 预览显示
 
 - 鼠标放在中央大图上滚动滚轮，可围绕鼠标所在的照片位置平滑放大或缩小；连续快速滚动会累加目标倍率，再逐帧平滑追赶，最高为 `400%`。
-- 放大后按住鼠标左键拖动可平移照片。拖动时先直接移动已有画面，接近缓冲边缘或松开鼠标后再生成新画面。
-- 主预览只裁取“当前可见区域＋小范围拖动缓冲”，并在后台使用 Bicubic（双三次插值）重采样；旧视口的后台结果会被丢弃。大幅缩小时使用 Pillow 的两阶段缩小优化，减少重采样等待。
+- 放大后按住鼠标左键拖动可平移照片；拖动由 VisPy 相机直接更新，不会触发 CPU 端整张预览重采样。
+- 主预览现在直接使用 PySide6 + VisPy/OpenGL：照片上传为 GPU 纹理后，缩放、平移和插值都由 GPU 完成，不再在每个滚轮事件中由 Pillow 重新生成整张 CPU 预览帧。首次上传时会主动刷新插值查找尺寸，避免首帧模糊。
 - `Z` 在“适合屏幕”和 `100%` 之间切换，`1` 直接显示 `100%`，`+` / `-` 可逐级调整倍率；切换到下一张照片时回到适合屏幕。
 - RAW+JPG 绑定组以 JPG 作为预览，RAW 只在导出时按当前模式复制。
 
 对于 RAW+JPG 绑定组，第一次按 `Space` 默认选择两张；顶部“模式”按钮或按 `F` 会按“RAW+JPG → 仅 JPG → 仅 RAW → RAW+JPG”的顺序循环。模式与保留状态相互独立：修改模式不会自动保留/取消，取消保留也不会重置模式。导出时只复制当前模式指定的原文件，选片记录会自动保存。
 
 “全不保留”（`Ctrl+Shift+X`）会在确认后取消当前文件夹所有保留状态，但保留各组的 RAW/JPG 模式；“重置模式”（`Ctrl+Shift+M`）会在确认后把所有绑定组模式恢复为 RAW+JPG，但不改变保留状态。
+
+## GPU 主预览与设置
+
+主窗口中央的大图就是 PySide6 + VisPy/OpenGL GPU 预览，右侧“GPU 预览设置”直接作用于主预览。主界面使用 Qt 的完整事件循环，VisPy 相机动画不再依赖 Tk→Qt 的事件泵，因此滚轮缩放、拖动平移和连续翻图共用同一套渲染路径。
+
+- “插值”可切换 `cubic`、`catrom`、`linear`、`nearest`；切换后会立即作用于 GPU 纹理。
+- “平滑滚轮缩放”控制是否使用指针锚定的 120 Hz 缓动；关闭后仍可滚轮缩放，但会直接应用倍率。
+- “最大倍率”可选 `4×`、`8×`、`16×`、`32×`，设置会保存到 `%LOCALAPPDATA%\PhotoCuller\settings.json`。
+- GPU 主预览支持滚轮缩放、左键拖动、`[` / `]` 切换组、`Space` 保留、`F` 切换 RAW+JPG 模式、`Z` 适合屏幕、`1` 显示 100%。
+- 预览只在切换照片时重新上传纹理；相机动画不会重新读取磁盘，也不会改变全量 JPG 内存缓存。
+- 当前 GPU 可用性会显示在设置框中。正式入口需要 PySide6、VisPy、PyOpenGL 和 NumPy；这些依赖已经列入 `requirements.txt` 并随 EXE 打包。
 
 ## 格式
 
@@ -46,5 +57,18 @@
 ```powershell
 $env:TCL_LIBRARY = (Resolve-Path '..\tk_runtime\tcl\tcl8.6')
 $env:TK_LIBRARY = (Resolve-Path '..\tk_runtime\tcl\tk8.6')
-pyinstaller --noconfirm --clean --onefile --windowed --name "Photo Culler" --collect-all rawpy --hidden-import tkinter --hidden-import _tkinter --add-data "..\tk_runtime\tcl;tcl" --add-binary "..\tk_runtime\bin\tcl86t.dll;bin" --add-binary "..\tk_runtime\bin\tk86t.dll;bin" app.py
+$env:PHOTO_CULLER_TK_RUNTIME = (Resolve-Path '..\tk_runtime')
+pyinstaller --noconfirm --clean "Photo Culler.spec"
+```
+
+打包后可用以下命令验证 GPU 后端（不会打开主选片窗口）：
+
+```powershell
+dist\Photo Culler.exe --gpu-self-test
+```
+
+验证正式主窗口的 Qt/VisPy 路径（隐藏窗口，不会弹文件夹选择框）：
+
+```powershell
+dist\Photo Culler.exe --qt-main-self-test
 ```

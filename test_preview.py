@@ -5,12 +5,21 @@ import unittest
 from PIL import Image
 
 from app import (
+    GPU_PREVIEW_DEFAULT_INTERPOLATION,
+    GPU_PREVIEW_DEFAULT_MAX_MAGNIFICATION,
+    GPU_PREVIEW_DEFAULT_SMOOTH_ZOOM,
+    GPU_PREVIEW_INTERPOLATIONS,
+    GPU_PREVIEW_MAX_MAGNIFICATIONS,
+    GPU_PUMP_ACTIVE_INTERVAL_MS,
+    GPU_PUMP_IDLE_INTERVAL_MS,
     PREVIEW_RESAMPLING_FILTER,
     PREVIEW_REDUCING_GAP,
     PreviewGeometry,
     PhotoCuller,
+    _GpuPreviewController,
     advance_zoom_scale,
     clamp_zoom_scale,
+    normalize_gpu_preview_settings,
     zoom_target_after_wheel,
 )
 
@@ -28,6 +37,58 @@ class _CanvasStub:
 
 
 class PreviewTests(unittest.TestCase):
+    def test_gpu_event_pump_uses_fast_interval_only_during_animation(self) -> None:
+        class AfterStub:
+            def __init__(self) -> None:
+                self.delay = None
+
+            def after(self, delay: int, _callback: object) -> str:
+                self.delay = delay
+                return "job"
+
+        class CameraStub:
+            animation_active = True
+
+        class WindowStub:
+            camera = CameraStub()
+
+        owner = AfterStub()
+        controller = object.__new__(_GpuPreviewController)
+        controller.owner = owner
+        controller.window = WindowStub()
+        controller._pump_job = None
+        controller._closing = False
+        _GpuPreviewController._schedule_pump(controller)
+        self.assertEqual(owner.delay, GPU_PUMP_ACTIVE_INTERVAL_MS)
+
+        controller._pump_job = None
+        controller.window.camera.animation_active = False
+        _GpuPreviewController._schedule_pump(controller)
+        self.assertEqual(owner.delay, GPU_PUMP_IDLE_INTERVAL_MS)
+
+    def test_gpu_preview_settings_are_validated_and_defaulted(self) -> None:
+        defaults = normalize_gpu_preview_settings({})
+        self.assertEqual(defaults["interpolation"], GPU_PREVIEW_DEFAULT_INTERPOLATION)
+        self.assertEqual(defaults["max_magnification"], GPU_PREVIEW_DEFAULT_MAX_MAGNIFICATION)
+        self.assertEqual(defaults["smooth_zoom"], GPU_PREVIEW_DEFAULT_SMOOTH_ZOOM)
+
+        settings = normalize_gpu_preview_settings(
+            {"interpolation": "catrom", "smooth_zoom": False, "max_magnification": "32"}
+        )
+        self.assertEqual(settings, {"interpolation": "catrom", "smooth_zoom": False, "max_magnification": "32"})
+        self.assertEqual(
+            normalize_gpu_preview_settings(
+                {"interpolation": "invalid", "smooth_zoom": "false", "max_magnification": "999"}
+            ),
+            {
+                "interpolation": GPU_PREVIEW_DEFAULT_INTERPOLATION,
+                "smooth_zoom": GPU_PREVIEW_DEFAULT_SMOOTH_ZOOM,
+                "max_magnification": GPU_PREVIEW_DEFAULT_MAX_MAGNIFICATION,
+            },
+        )
+        self.assertIn("catrom", GPU_PREVIEW_INTERPOLATIONS)
+        self.assertIn("32", GPU_PREVIEW_MAX_MAGNIFICATIONS)
+
     def test_central_preview_uses_bicubic_resampling(self) -> None:
         self.assertEqual(PREVIEW_RESAMPLING_FILTER, Image.Resampling.BICUBIC)
 
